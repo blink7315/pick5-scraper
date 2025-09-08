@@ -1,0 +1,39 @@
+name: Run pick5 scraper
+
+on:
+  schedule:
+    # Tue & Thu 12:30 PM America/Detroit while in EDT (UTC-4)
+    - cron: "30 16 * * 2,4"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python & Playwright deps
+        run: |
+          pip install --upgrade pip
+          pip install playwright gspread google-auth gspread-formatting
+          python -m playwright install --with-deps chromium
+
+      - name: Write Google service account file
+        run: |
+          printf '%s' "${GOOGLE_SA_JSON}" > credentials.json
+        env:
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+
+      - name: Run scraper
+        env:
+          PICK_SHEET_ID: ${{ secrets.PICK_SHEET_ID }}
+          COLLEGE_SHEET_ID: ${{ secrets.COLLEGE_SHEET_ID }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python pick5_scraper.py
