@@ -265,10 +265,9 @@ def find_abbreviation(team_name, logo_url=""):
 # =========================
 def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
     """
-    Robust NFL scraper:
-      - Tolerant selectors for sections/rows/teams/odds
-      - Auto-advance to next week if page is still on last week
-      - Rich debug logging
+    NFL scraper that normalizes to the *current football week* (Mon..next Mon).
+    If the first page is last week or next week, it navigates with Next/Prev Week
+    up to 2 times until at least one game falls inside the current week window.
     """
     print("Launching browser and scraping NFL schedule...")
     base_url = "https://www.espn.com/nfl/schedule"
@@ -277,47 +276,38 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
         if week is not None else base_url
     )
 
+    # ----- helpers -----
     def _section_locators(page):
-        # ESPN shuffles wrappers occasionally; try a few
         candidates = [
-            "div.ScheduleTables > div",          # original structure
-            "section.ScheduleTables > div",      # alt section tag
-            "div.ScheduleTables",                # whole block (we'll find tbodys under it)
+            "div.ScheduleTables > div",
+            "section.ScheduleTables > div",
+            "div.ScheduleTables",
         ]
         for sel in candidates:
             loc = page.locator(sel)
-            cnt = loc.count()
-            if cnt > 0:
-                print(f"Using sections selector: {sel} (count={cnt})")
+            if loc.count() > 0:
+                print(f"Using sections selector: {sel} (count={loc.count()})")
                 return sel, loc
-        print("No obvious section wrapper found; will scan for any TBODY rows directly.")
+        print("No obvious section wrapper found; will scan TBODY directly.")
         return None, page.locator("tbody")
 
     def _extract_rows_from_section(section):
         rows = []
-        # Try common row containers
         tbodys = section.locator("tbody")
-        n_tb = tbodys.count()
-        if n_tb == 0:
-            # Some variants nest trs directly
-            tbodys = section
-            n_tb = 1
+        n_tb = tbodys.count() or 1
         for tbi in range(n_tb):
-            tbody = tbodys.nth(tbi)
+            tbody = tbodys.nth(tbi) if tbodys.count() > 0 else section
             trs = tbody.locator("tr")
             for j in range(trs.count()):
                 rows.append(trs.nth(j))
         return rows
 
     def _get_team_text(cell):
-        # Prefer team links; grab the last link (city + nickname often split)
-        # Fallback to text content.
         try:
             links = cell.locator("a[href*='/team/']")
             if links.count() == 0:
                 links = cell.locator("span.Table__Team a")
             if links.count() > 0:
-                # last() may not exist in Python API; emulate
                 return links.nth(links.count() - 1).text_content(timeout=2000).strip()
         except Exception:
             pass
@@ -333,13 +323,11 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
         return ""
 
     def _parse_odds_cells(tds):
-        # ESPN moves odds; try from rightmost cells that have anchor text
         line, ou = "N/A", "N/A"
         try:
-            # scan all anchors in the row
             anchors = tds.locator("a")
             for k in range(anchors.count()):
-                raw = (anchors.nth(k).text_content(timeout=1000) or "").strip()
+                raw = (anchors.nth(k).text_content(timeout=800) or "").strip()
                 t = raw.lower().replace("\u00bd", ".5")
                 if t.startswith("line:") or t.startswith("spread:"):
                     line = raw.split(":", 1)[-1].strip()
@@ -351,18 +339,16 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
             pass
         return line, ou
 
-    def collect_from_current_page(page):
+    def _collect_from_page(page):
         collected = []
         sections_sel, sections = _section_locators(page)
         if sections.count() == 0:
             print("⚠️ No sections found; page structure may have changed.")
             return collected
 
-        # If selector is the whole block, treat it as one section
         num_sections = sections.count() if sections_sel != "div.ScheduleTables" else 1
         for i in range(num_sections):
             section = sections.nth(i) if sections_sel != "div.ScheduleTables" else sections
-            # Date header is optional; if missing, keep empty and rely on kickoff parse later
             try:
                 date_header = (section.locator(".Table__Title").first.text_content() or "").strip()
             except Exception:
@@ -373,9 +359,7 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                 if tds.count() < 2:
                     continue
 
-                away_cell = tds.nth(0)
-                home_cell = tds.nth(1)
-
+                away_cell = tds.nth(0); home_cell = tds.nth(1)
                 away_team = _get_team_text(away_cell)
                 home_team = _get_team_text(home_cell)
                 if not away_team or not home_team:
@@ -395,7 +379,7 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
 
                 line, ou = _parse_odds_cells(tds)
 
-                def resolve_abbreviation_by_logo(team_name, logo_url):
+                def _abbr(team_name, logo_url):
                     u = (logo_url or "").lower()
                     if "nyg" in u: return "NYG"
                     if "nyj" in u: return "NYJ"
@@ -403,8 +387,8 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                     if "lac" in u: return "LAC"
                     return find_abbreviation(team_name)
 
-                away_abbr = resolve_abbreviation_by_logo(away_team, away_logo_url)
-                home_abbr = resolve_abbreviation_by_logo(home_team, home_logo_url)
+                away_abbr = _abbr(away_team, away_logo_url)
+                home_abbr = _abbr(home_team, home_logo_url)
 
                 away_line = home_line = "N/A"
                 if line != "N/A" and away_abbr and home_abbr:
@@ -432,46 +416,65 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
         print(f"Collected NFL rows: {len(collected)}")
         return collected
 
+    def _any_in_current_week(rows, week_start, week_end):
+        hits = 0
+        for i in range(0, len(rows), 2):
+            dt = parse_kickoff_local(rows[i][6], rows[i][7], TIMEZONE)
+            if dt and (week_start <= dt < week_end):
+                hits += 1
+        print(f"Rows in current week window: {hits}")
+        return hits > 0
+
+    def _all_before(rows, week_start):
+        kicks = []
+        for i in range(0, len(rows), 2):
+            dt = parse_kickoff_local(rows[i][6], rows[i][7], TIMEZONE)
+            if dt: kicks.append(dt)
+        return bool(kicks) and max(kicks) < week_start
+
+    def _all_after(rows, week_end):
+        kicks = []
+        for i in range(0, len(rows), 2):
+            dt = parse_kickoff_local(rows[i][6], rows[i][7], TIMEZONE)
+            if dt: kicks.append(dt)
+        return bool(kicks) and min(kicks) >= week_end
+
     tz = ZoneInfo(TIMEZONE)
+    week_start = _football_week_monday(datetime.now(tz))
+    week_end = week_start + timedelta(days=7)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url, timeout=60000)
         page.wait_for_selector("body", timeout=15000)
 
-        rows = collect_from_current_page(page)
+        rows = _collect_from_page(page)
 
-        # If we got nothing OR everything is before this week's Monday, try advancing a week once.
-        this_mon = (datetime.now(tz) - timedelta(days=datetime.now(tz).weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-
-        def all_before_this_week(rws):
-            kicks = []
-            for i in range(0, len(rws), 2):
-                dt = parse_kickoff_local(rws[i][6], rws[i][7], TIMEZONE)
-                if dt:
-                    kicks.append(dt)
-            return len(rws) > 0 and kicks and all(k < this_mon for k in kicks)
-
-        try_advance = False
-        if len(rows) == 0:
-            print("No NFL rows found; will try advancing to next week once.")
-            try_advance = True
-        elif all_before_this_week(rows):
-            print("NFL rows exist but appear to be last week; will try advancing to next week once.")
-            try_advance = True
-
-        if try_advance:
+        # Try up to 2 navigations to land on the current week.
+        for _ in range(2):
+            if _any_in_current_week(rows, week_start, week_end):
+                break
             try:
-                next_btn = page.locator("button[aria-label='Next Week'], a[aria-label='Next Week']")
-                if next_btn.count() > 0:
-                    next_btn.first.click()
-                    page.wait_for_selector("body", timeout=15000)
-                    rows = collect_from_current_page(page)
-                    print("Advanced one week and re-scraped.")
+                if _all_before(rows, week_start):
+                    print("Looks like previous week; clicking Next Week …")
+                    nxt = page.locator("button[aria-label='Next Week'], a[aria-label='Next Week']")
+                    if nxt.count() > 0:
+                        nxt.first.click()
+                        page.wait_for_selector("body", timeout=15000)
+                        rows = _collect_from_page(page)
+                        continue
+                if _all_after(rows, week_end):
+                    print("Looks like future week; clicking Previous Week …")
+                    prv = page.locator("button[aria-label='Previous Week'], a[aria-label='Previous Week']")
+                    if prv.count() > 0:
+                        prv.first.click()
+                        page.wait_for_selector("body", timeout=15000)
+                        rows = _collect_from_page(page)
+                        continue
             except Exception as e:
-                print(f"Advance failed (continuing with current page): {e}")
+                print(f"Week navigation failed (continuing): {e}")
+                break
 
         browser.close()
         return rows
