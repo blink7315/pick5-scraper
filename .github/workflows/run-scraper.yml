@@ -1,49 +1,45 @@
 name: Run pick5 scraper
 
-- name: Run scraper
-  env:
-    PICK_SHEET_ID: ${{ secrets.PICK_SHEET_ID }}
-    COLLEGE_SHEET_ID: ${{ secrets.COLLEGE_SHEET_ID }}
-    GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
-    NFL_WEEK_OVERRIDE: "37"     # <-- set the exact NFL week you want
-    NFL_YEAR_OVERRIDE: "2025"   # <-- optional; include if needed
-  run: python pick5_scraper.py
-
-
 on:
-  schedule:
-    # Tue & Thu 12:30 PM America/Detroit while in EDT (UTC-4)
-    - cron: "30 16 * * 2,4"
+  # Keep schedule commented while testing manual runs.
+  # When you're ready, switch to the DST-safe 5pm version I’ll give you after this works.
+  # schedule:
+  #   - cron: "30 16 * * 2,4"
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repo
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Python & Playwright deps
+      - name: Install dependencies (Python + Playwright)
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install playwright gspread google-auth gspread-formatting
-          python -m playwright install --with-deps chromium
+          playwright install --with-deps chromium
 
       - name: Write Google service account file
         run: |
-          printf '%s' "${GOOGLE_SA_JSON}" > credentials.json
-        env:
-          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          cat > credentials.json <<'JSON'
+          ${{ secrets.GOOGLE_SA_JSON }}
+          JSON
 
       - name: Run scraper
         env:
           PICK_SHEET_ID: ${{ secrets.PICK_SHEET_ID }}
-          COLLEGE_SHEET_ID: ${{ secrets.COLLEGE_SHEET_ID }}
+          COLLEGE_SHEET_ID: ${{ secrets.COLL EGE_SHEET_ID }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           PYTHONUNBUFFERED: "1"
-        run: |
-          python pick5_scraper.py
+          # Deterministic NFL override while we debug:
+          NFL_WEEK_OVERRIDE: "37"
+          NFL_YEAR_OVERRIDE: "2025"
+        run: python pick5_scraper.py
