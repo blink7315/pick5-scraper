@@ -41,6 +41,16 @@ TEST_MODE_IGNORE_LOCKS = False  # set to False in real runs
 # --- Optional week targeting (leave as None to use ESPN's active week) ---
 NFL_YEAR = None
 NFL_WEEK = None        # set None to use ESPN's current "active" week
+
+# --- Optional overrides via environment (for deterministic runs) ---
+NFL_WEEK_OVERRIDE = os.environ.get("NFL_WEEK_OVERRIDE")  # e.g., "37"
+NFL_YEAR_OVERRIDE = os.environ.get("NFL_YEAR_OVERRIDE")  # e.g., "2025"
+
+if NFL_WEEK_OVERRIDE:
+    NFL_WEEK = int(NFL_WEEK_OVERRIDE)
+if NFL_YEAR_OVERRIDE:
+    NFL_YEAR = int(NFL_YEAR_OVERRIDE)
+
 CFB_YEAR = None
 CFB_WEEK = None        # set None to use ESPN's current "active" week
 
