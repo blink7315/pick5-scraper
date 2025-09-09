@@ -1,11 +1,9 @@
 name: Run pick5 scraper
 
 on:
-  # Keep schedule commented while testing manual runs.
-  # When you're ready, switch to the DST-safe 5pm version I’ll give you after this works.
-  # schedule:
-  #   - cron: "30 16 * * 2,4"
+  # manual only while testing
   workflow_dispatch: {}
+  # when ready, we’ll add the DST-safe 5pm schedule
 
 jobs:
   run:
@@ -36,10 +34,10 @@ jobs:
       - name: Run scraper
         env:
           PICK_SHEET_ID: ${{ secrets.PICK_SHEET_ID }}
-          COLLEGE_SHEET_ID: ${{ secrets.COLL EGE_SHEET_ID }}
+          COLLEGE_SHEET_ID: ${{ secrets.COLLEGE_SHEET_ID }}   # <-- fixed
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           PYTHONUNBUFFERED: "1"
-          # Deterministic NFL override while we debug:
+          # temporary deterministic NFL override (optional)
           NFL_WEEK_OVERRIDE: "37"
           NFL_YEAR_OVERRIDE: "2025"
         run: python pick5_scraper.py
