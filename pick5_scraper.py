@@ -266,42 +266,35 @@ def find_abbreviation(team_name, logo_url=""):
 def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
     print("Launching browser and scraping NFL schedule...")
     base_url = "https://www.espn.com/nfl/schedule"
-    if week is not None:
-        url = f"{base_url}/_/week/{week}" + (f"/year/{year}" if year is not None else "")
-    else:
-        url = base_url
+    url = (
+        f"{base_url}/_/week/{week}" + (f"/year/{year}" if (week is not None and year is not None) else "")
+        if week is not None else base_url
+    )
 
-    all_data = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, timeout=60000)
-        page.wait_for_selector("div.ScheduleTables", timeout=15000)
-
+    def collect_from_current_page(page):
+        data = []
         date_sections = page.locator("div.ScheduleTables > div")
-        print(f"✅ Found {date_sections.count()} game date sections\n")
-
-        for i in range(date_sections.count()):
+        count = date_sections.count()
+        print(f"✅ Found {count} NFL game date sections\n")
+        for i in range(count):
             section = date_sections.nth(i)
-            date_header = section.locator("div.Table__Title").text_content().strip()
+            date_header = (section.locator("div.Table__Title").text_content() or "").strip()
             rows = section.locator("tbody tr")
-
             for j in range(rows.count()):
                 row = rows.nth(j)
                 tds = row.locator("td")
                 if tds.count() < 2:
                     continue
 
-                away_team_cell = tds.nth(0)
-                home_team_cell = tds.nth(1)
+                away_cell = tds.nth(0)
+                home_cell = tds.nth(1)
 
-                away_team = away_team_cell.locator("span.Table__Team a").nth(1).text_content(timeout=2000).strip()
-                home_team = home_team_cell.locator("span.Table__Team a").nth(1).text_content(timeout=2000).strip()
+                away_team = away_cell.locator("span.Table__Team a").nth(1).text_content(timeout=2000).strip()
+                home_team = home_cell.locator("span.Table__Team a").nth(1).text_content(timeout=2000).strip()
                 game_time = tds.nth(2).text_content(timeout=1000).strip() if tds.count() > 2 else "N/A"
 
-                away_logo_url = away_team_cell.locator("img").get_attribute("src") or ""
-                home_logo_url = home_team_cell.locator("img").get_attribute("src") or ""
-
+                away_logo_url = away_cell.locator("img").get_attribute("src") or ""
+                home_logo_url = home_cell.locator("img").get_attribute("src") or ""
                 away_logo_formula = get_logo_formula(away_team, away_logo_url, league="nfl")
                 home_logo_formula = get_logo_formula(home_team, home_logo_url, league="nfl")
 
@@ -310,13 +303,11 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                     odds_links = tds.nth(6).locator("a")
                     for k in range(odds_links.count()):
                         raw = odds_links.nth(k).text_content(timeout=1000).strip()
-                        t = raw.lower().replace("\u00bd", ".5")  # handle ½
-                        # Accept multiple labels that ESPN uses
+                        t = raw.lower().replace("\u00bd", ".5")
                         if t.startswith("line:") or t.startswith("spread:"):
                             line = raw.split(":", 1)[-1].strip()
                         elif t.startswith("o/u:") or t.startswith("total:"):
                             ou = raw.split(":", 1)[-1].strip()
-                        # Fallback: sometimes the anchor is just "ILL -45.5"
                         elif re.match(r"^[A-Za-z]{2,4}\s*[+-]\d+(\.\d+)?$", raw):
                             line = raw.strip()
 
@@ -351,12 +342,43 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                 ou_top = f"O {ou}" if ou != "N/A" else "N/A"
                 ou_bottom = f"U {ou}" if ou != "N/A" else "N/A"
 
-                # A..H: Logo, Team, Pick#, Line, Pick#, O/U, Date, Time
-                all_data.append([away_logo_formula, away_team, "", away_line, "", ou_top, date_header, game_time])
-                all_data.append([home_logo_formula, home_team, "", home_line, "", ou_bottom, date_header, game_time])
+                data.append([away_logo_formula, away_team, "", away_line, "", ou_top, date_header, game_time])
+                data.append([home_logo_formula, home_team, "", home_line, "", ou_bottom, date_header, game_time])
+        return data
+
+    tz = ZoneInfo(TIMEZONE)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(url, timeout=60000)
+        page.wait_for_selector("div.ScheduleTables", timeout=20000)
+
+        rows = collect_from_current_page(page)
+
+        # If every parsed kickoff < this week's Monday, ESPN is still showing last week -> click "Next Week" once
+        this_mon = _football_week_monday(datetime.now(tz))
+
+        def _all_before_this_week(rows):
+            kicks = []
+            for i in range(0, len(rows), 2):
+                dt = parse_kickoff_local(rows[i][6], rows[i][7], TIMEZONE)  # uses away row; home is same
+                if dt:
+                    kicks.append(dt)
+            return bool(kicks) and all(k < this_mon for k in kicks)
+
+        if _all_before_this_week(rows):
+            try:
+                nxt = page.locator("button[aria-label='Next Week']")
+                if nxt.count() > 0:
+                    nxt.first.click()
+                    page.wait_for_selector("div.ScheduleTables", timeout=20000)
+                    rows = collect_from_current_page(page)
+                    print("⚠️ ESPN showed previous week; advanced to next week automatically.")
+            except Exception:
+                pass
 
         browser.close()
-        return all_data
+        return rows
 
 def _normalize_name(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s&'-]", "", s)).strip().lower()
@@ -663,22 +685,19 @@ def _cleanup_legacy_misaligned_rows(lines_ws):
         deleted += (e - s + 1)
     return deleted
 
+def _football_week_monday(dt: datetime) -> datetime:
+    """Return Monday 00:00 of dt's week in TIMEZONE (local)."""
+    dt = dt.astimezone(ZoneInfo(TIMEZONE))
+    wkmon = (dt - timedelta(days=dt.weekday()))
+    return wkmon.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=ZoneInfo(TIMEZONE))
+
 def _purge_lines_to_current_week(spreadsheet, now_dt: datetime, phase_cfb: str, phase_nfl: str):
     """
-    Keep only rows that are in the CURRENT publish window for each league.
-    This replaces ISO-week-based pruning to avoid deleting Monday games
-    that belong to the next ISO week but are still inside the Thu window.
-
-    Policy stays in sync with publish_window_allows():
-      - If today is TUE: keep Thu–Fri of this football week
-      - If today is THU: keep Sat–Mon (next Monday) of this football week
-      - Else: keep nothing new (but we won't delete locked rows)
-
-    Rows are preserved if:
-      - They are locked (P == 'Y'), OR
-      - Their KickoffLocal (col M) is in-window for now_dt.
-
-    Anything else can be deleted safely.
+    NEW POLICY:
+      - Define the current football week as Monday 00:00 local -> next Monday 00:00 (exclusive).
+      - KEEP any pair whose KickoffLocal (col M) falls within this window.
+      - DELETE everything else (even if Locked = Y).
+      - Blank/invalid KickoffLocal => delete.
     """
     try:
         lines_ws = spreadsheet.worksheet("Lines")
@@ -689,13 +708,12 @@ def _purge_lines_to_current_week(spreadsheet, now_dt: datetime, phase_cfb: str, 
     if not vals or len(vals) < 2:
         return
 
-    # Column indexes (1-based in Sheets, 0-based here)
-    COL_LEAGUE = 8   # I
-    COL_KICK   = 12  # M
-    COL_LOCK   = 15  # P
+    COL_KICK = 12  # M "YYYY-MM-DD HH:MM" local
 
-    # Helper: parse KickoffLocal "YYYY-MM-DD HH:MM" in TIMEZONE
-    def parse_kick_str(s: str) -> datetime | None:
+    week_start = _football_week_monday(now_dt)
+    week_end = week_start + timedelta(days=7)  # exclusive
+
+    def parse_kick(s: str) -> datetime | None:
         s = (s or "").strip()
         if not s:
             return None
@@ -704,71 +722,36 @@ def _purge_lines_to_current_week(spreadsheet, now_dt: datetime, phase_cfb: str, 
         except Exception:
             return None
 
-    # Compute in-window predicate using your policy
-    def in_window_for_now(kick: datetime | None) -> bool:
-        return publish_window_allows(now_dt, kick)
-
-    # We’ll delete only contiguous blocks of 2-row pairs that are NOT in-window and NOT locked
     to_delete_tops = []
-
-    for top in range(2, len(vals) + 1, 2):  # pair tops: 2,4,6,...
+    for top in range(2, len(vals) + 1, 2):  # pair tops
         row_top = vals[top - 1]
-        if len(row_top) < max(COL_LEAGUE, COL_KICK, COL_LOCK) + 1:
+        if len(row_top) < COL_KICK:
+            to_delete_tops.append(top)
             continue
-
-        league = (row_top[COL_LEAGUE] or "").strip().lower()
-        lock   = (row_top[COL_LOCK] or "").strip().upper()
-        kick_s = (row_top[COL_KICK] or "").strip()
-        kick_dt = parse_kick_str(kick_s)
-
-        # Never delete locked rows
-        if lock == "Y":
-            continue
-
-        # Only consider NCAAF/NFL rows
-        if league not in ("nfl", "ncaaf"):
-            continue
-
-        # Keep rows in current publish window
-        if in_window_for_now(kick_dt):
-            continue
-
-        # Otherwise, safe to delete this pair
-        to_delete_tops.append(top)
+        k = parse_kick(row_top[COL_KICK - 1])
+        if not k or not (week_start <= k < week_end):
+            to_delete_tops.append(top)
 
     if not to_delete_tops:
-        print("Purge: nothing to delete.")
+        print("Purge: nothing to delete (current-week filter).")
         return
 
-    # Group contiguous 2-row blocks
-    blocks = []
-    start = None
-    prev = None
+    # group contiguous 2-row blocks and delete bottom-up
+    blocks, start, prev = [], None, None
     for t in to_delete_tops:
         if start is None:
-            start, prev = t, t
+            start = prev = t
         elif t == prev + 2:
             prev = t
         else:
-            blocks.append((start, prev + 1))  # include second row of last pair
-            start, prev = t, t
+            blocks.append((start, prev + 1))
+            start = prev = t
     blocks.append((start, prev + 1))
 
-    # SAFETY: ensure at least one non-frozen row remains
-    frozen_rows = 1
-    cur_rows = lines_ws.row_count
-    rows_to_delete = sum((e - s + 1) for s, e in blocks)
-    remaining_after = cur_rows - frozen_rows - rows_to_delete
-    if remaining_after <= 1:
-        new_total_rows = cur_rows + (2 if remaining_after < 2 else 0)
-        print(f"⚠️ Purge would delete all non-frozen rows. Pre-growing grid {cur_rows}→{new_total_rows}")
-        lines_ws.resize(rows=new_total_rows, cols=lines_ws.col_count)
-
-    # Delete bottom-up
     for s, e in reversed(blocks):
         lines_ws.delete_rows(s, e)
 
-    print("Purge: completed (window-aligned).")
+    print("Purge: completed (kept only current football week).")
 
 def queue_pair_range(ws_title: str, top_row: int, full_away: list, full_home: list):
     """
@@ -836,15 +819,17 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
     """
     staging_rows: flat list of rows (away, home, away, home, ...)
     Merge into 'Lines' by GameKey with placeholders, release/freeze windows, and locks.
+    Now:
+      - Purge keeps only current football week (Mon..Mon).
+      - When appending CFB after any existing data, insert 4 blank rows.
     """
     tz = ZoneInfo(TIMEZONE)
-    # TEST MODE "now" (matches your prior constant)
     now = datetime.now(tz)
 
-    # Normalize rows to A..H (Logo, Team, Pick#, Line, Pick#, O/U, Date, Time)
+    # Normalize to A..H
     staging_rows = normalize_rows_to_AH(staging_rows)
 
-    # Ensure Lines exists + headers
+    # Ensure ws + headers
     try:
         lines_ws = spreadsheet.worksheet("Lines")
     except gspread.exceptions.WorksheetNotFound:
@@ -857,7 +842,7 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
     if deleted:
         print(f"🧹 Removed {deleted} legacy misaligned rows from Lines.")
 
-    # Purge old weeks so Lines only contains the current week per league
+    # Purge to current football week only (deletes even Locked=Y if out-of-week)
     _purge_lines_to_current_week(
         spreadsheet,
         now_dt=now,
@@ -865,24 +850,17 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
         phase_nfl=phase if league == "nfl"   else PHASE_NFL
     )
 
-    # 🔄 IMPORTANT: refresh handle; row_count/col_count can be stale after deletes
+    # Refresh + read existing
     lines_ws = spreadsheet.worksheet("Lines")
-
-    # Rebuild 'existing' AFTER purge
     existing = lines_ws.get_all_values()
 
-    # Insert a spacer before the very first CFB block if NFL already exists
+    # --- Spacer: if appending CFB and there is any existing data, add 4 rows ---
     spacer_rows = 0
-    if league == "ncaaf":
-        # existing includes header at index 0
-        leagues = [(row[8] or "").strip().lower() for row in existing[1:] if len(row) >= 9]
-        has_nfl = any(l == "nfl" for l in leagues)
-        has_cfb = any(l == "ncaaf" for l in leagues)
-        if has_nfl and not has_cfb:
-            spacer_rows = SPACER_ROWS_BETWEEN_LEAGUES if "SPACER_ROWS_BETWEEN_LEAGUES" in globals() else 4
+    if league == "ncaaf" and len(existing) > 1:
+        spacer_rows = SPACER_ROWS_BETWEEN_LEAGUES
 
-    # Build index of existing games by GameKey (top row only)
-    gamekey_col = 12  # L
+    # Index existing games by GameKey (L)
+    gamekey_col = 12
     index = {}
     for r in range(2, len(existing)+1, 2):
         row_vals = existing[r-1]
@@ -896,17 +874,14 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
     def fmt(dt):
         return dt.astimezone(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M") if dt else ""
 
-    # Compute the next append TOP row, applying spacer and keeping it even
     last_row_with_data = len(existing) if existing else 1
     append_top = last_row_with_data + 1 + spacer_rows
     if append_top < 2:
         append_top = 2
     if append_top % 2 == 1:
-        append_top += 1  # bump to even
+        append_top += 1
 
-    queued_ranges = []
-    touched_new = []   # for formatting
-    touched_upd = []   # for formatting
+    queued_ranges, touched_new, touched_upd = [], [], []
 
     for g in games:
         kickoff_dt = parse_kickoff_local(g["date_text"], g["time_text"], TIMEZONE)
@@ -920,44 +895,34 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
 
         window_ok = publish_window_allows(now, kickoff_dt)
 
-        # Only publish if we're in-window AND past the release time
+        # Window+time gates
         if window_ok and release_at and now >= release_at:
-            status = "posted"
-            allow_lines = True
-
-        # Only lock (and still allow lines to show) if we're in-window AND past freeze time
+            status = "posted"; allow_lines = True
         if window_ok and freeze_at and now >= freeze_at:
-            locked_flag = "Y"
-            status = "locked"
-            allow_lines = True
+            locked_flag = "Y"; status = "locked"; allow_lines = True
 
-        a = g["away_row"][:]  # A..H
+        a = g["away_row"][:]
         h = g["home_row"][:]
 
-        if not allow_lines:
-            # Only strip for brand-new games; never touch existing rows
-            if game_key not in index:
-                a[3] = ""  # D Line
-                h[3] = ""
-                a[5] = ""  # F O/U
-                h[5] = ""
+        # Strip lines/O-U for brand new rows if not allowed yet
+        if not allow_lines and game_key not in index:
+            a[3] = ""; h[3] = ""; a[5] = ""; h[5] = ""
         else:
-            # Normalize "N/A" to blank when we ARE allowed to publish
             for row in (a, h):
                 if row[3] == "N/A": row[3] = ""
                 if row[5] == "N/A": row[5] = ""
 
         meta = [
-            ("ncaaf" if league == "ncaaf" else "nfl"),   # I League
-            week_tag,                                    # J WeekTag
-            phase,                                       # K Phase
-            game_key,                                    # L GameKey
-            fmt(kickoff_dt),                             # M KickoffLocal
-            fmt(release_at),                             # N ReleaseAt
-            fmt(freeze_at),                              # O FreezeAt
-            locked_flag,                                 # P Locked
-            status,                                      # Q Status
-            fmt(now),                                    # R LastUpdated
+            ("ncaaf" if league == "ncaaf" else "nfl"),   # I
+            week_tag,                                    # J
+            phase,                                       # K
+            game_key,                                    # L
+            fmt(kickoff_dt),                             # M
+            fmt(release_at),                             # N
+            fmt(freeze_at),                              # O
+            locked_flag,                                 # P
+            status,                                      # Q
+            fmt(now),                                    # R
         ]
 
         full_away = a + meta
@@ -965,57 +930,43 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
 
         if game_key not in index:
             rng = queue_pair_range(lines_ws.title, append_top, full_away, full_home)
-            queued_ranges.append(rng)
-            touched_new.append(rng["range"])
+            queued_ranges.append(rng); touched_new.append(rng["range"])
             index[game_key] = append_top
-            append_top += 2  # advance to next pair
+            append_top += 2
         else:
             top_row = index[game_key]
+            locked_cell = None
             try:
-                locked_cell = lines_ws.get_value(f"P{top_row}")  # existing lock state
+                locked_cell = lines_ws.get_value(f"P{top_row}")
             except Exception:
-                locked_cell = None
-
-            # Respect locked rows in real runs
+                pass
             if (not TEST_MODE_IGNORE_LOCKS) and locked_cell and str(locked_cell).upper() == "Y":
                 continue
-
-            # Out of publish window? Leave ENTIRE existing pair untouched.
             if not allow_lines:
                 continue
-
             upd = queue_pair_range(lines_ws.title, top_row, full_away, full_home)
-            queued_ranges.append(upd)
-            touched_upd.append(upd["range"])
+            queued_ranges.append(upd); touched_upd.append(upd["range"])
 
-    # === Strict, ordered write ===
+    # Strict, ordered write
     written_ranges, max_row_needed = upsert_lines_strict(lines_ws, queued_ranges)
 
-    # === Formatting on the rows we just touched ===
+    # Formatting for touched ranges
     if written_ranges:
-        # ensure capacity (harmless if already big enough)
         _ensure_grid_capacity(lines_ws, needed_rows=max_row_needed, needed_cols=18)
-
         with batch_updater(lines_ws.spreadsheet) as batch:
             right_border_thick = Border("SOLID_THICK")
             light_orange = Color(1.0, 0.898, 0.8)
             light_blue = Color(0.8, 0.898, 1.0)
-
             for rng in written_ranges:
                 m = re.match(r".*A(\d+):R(\d+)", rng)
-                if not m:
-                    continue
-                r1 = int(m.group(1))
-                r2 = int(m.group(2))
-                # Perimeter across A..H
+                if not m: continue
+                r1, r2 = int(m.group(1)), int(m.group(2))
                 batch.format_cell_range(lines_ws, f"A{r1}:H{r1}", CellFormat(borders=Borders(top=Border("SOLID"))))
                 batch.format_cell_range(lines_ws, f"A{r2}:H{r2}", CellFormat(borders=Borders(bottom=Border("SOLID"))))
                 batch.format_cell_range(lines_ws, f"A{r1}:A{r2}", CellFormat(borders=Borders(left=Border("SOLID"))))
                 batch.format_cell_range(lines_ws, f"H{r1}:H{r2}", CellFormat(borders=Borders(right=Border("SOLID"))))
-                # Header-like fills for C–F
                 batch.format_cell_range(lines_ws, f"C{r1}:D{r2}", CellFormat(backgroundColor=light_orange))
                 batch.format_cell_range(lines_ws, f"E{r1}:F{r2}", CellFormat(backgroundColor=light_blue))
-                # Thick vertical borders at B, D, F
                 batch.format_cell_range(lines_ws, f"B{r1}:B{r2}", CellFormat(borders=Borders(right=right_border_thick)))
                 batch.format_cell_range(lines_ws, f"D{r1}:D{r2}", CellFormat(borders=Borders(right=right_border_thick)))
                 batch.format_cell_range(lines_ws, f"F{r1}:F{r2}", CellFormat(borders=Borders(right=right_border_thick)))
