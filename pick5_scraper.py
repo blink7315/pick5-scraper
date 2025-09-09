@@ -264,6 +264,12 @@ def find_abbreviation(team_name, logo_url=""):
 # === SCRAPERS (8-col A..H output) ===
 # =========================
 def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
+    """
+    Robust NFL scraper:
+      - Tolerant selectors for sections/rows/teams/odds
+      - Auto-advance to next week if page is still on last week
+      - Rich debug logging
+    """
     print("Launching browser and scraping NFL schedule...")
     base_url = "https://www.espn.com/nfl/schedule"
     url = (
@@ -271,17 +277,98 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
         if week is not None else base_url
     )
 
+    def _section_locators(page):
+        # ESPN shuffles wrappers occasionally; try a few
+        candidates = [
+            "div.ScheduleTables > div",          # original structure
+            "section.ScheduleTables > div",      # alt section tag
+            "div.ScheduleTables",                # whole block (we'll find tbodys under it)
+        ]
+        for sel in candidates:
+            loc = page.locator(sel)
+            cnt = loc.count()
+            if cnt > 0:
+                print(f"Using sections selector: {sel} (count={cnt})")
+                return sel, loc
+        print("No obvious section wrapper found; will scan for any TBODY rows directly.")
+        return None, page.locator("tbody")
+
+    def _extract_rows_from_section(section):
+        rows = []
+        # Try common row containers
+        tbodys = section.locator("tbody")
+        n_tb = tbodys.count()
+        if n_tb == 0:
+            # Some variants nest trs directly
+            tbodys = section
+            n_tb = 1
+        for tbi in range(n_tb):
+            tbody = tbodys.nth(tbi)
+            trs = tbody.locator("tr")
+            for j in range(trs.count()):
+                rows.append(trs.nth(j))
+        return rows
+
+    def _get_team_text(cell):
+        # Prefer team links; grab the last link (city + nickname often split)
+        # Fallback to text content.
+        try:
+            links = cell.locator("a[href*='/team/']")
+            if links.count() == 0:
+                links = cell.locator("span.Table__Team a")
+            if links.count() > 0:
+                # last() may not exist in Python API; emulate
+                return links.nth(links.count() - 1).text_content(timeout=2000).strip()
+        except Exception:
+            pass
+        return (cell.text_content() or "").strip()
+
+    def _get_logo_url(cell):
+        try:
+            img = cell.locator("img")
+            if img.count() > 0:
+                return img.first.get_attribute("src") or ""
+        except Exception:
+            pass
+        return ""
+
+    def _parse_odds_cells(tds):
+        # ESPN moves odds; try from rightmost cells that have anchor text
+        line, ou = "N/A", "N/A"
+        try:
+            # scan all anchors in the row
+            anchors = tds.locator("a")
+            for k in range(anchors.count()):
+                raw = (anchors.nth(k).text_content(timeout=1000) or "").strip()
+                t = raw.lower().replace("\u00bd", ".5")
+                if t.startswith("line:") or t.startswith("spread:"):
+                    line = raw.split(":", 1)[-1].strip()
+                elif t.startswith("o/u:") or t.startswith("total:"):
+                    ou = raw.split(":", 1)[-1].strip()
+                elif re.match(r"^[A-Za-z]{2,4}\s*[+-]\d+(\.\d+)?$", raw):
+                    line = raw.strip()
+        except Exception:
+            pass
+        return line, ou
+
     def collect_from_current_page(page):
-        data = []
-        date_sections = page.locator("div.ScheduleTables > div")
-        count = date_sections.count()
-        print(f"✅ Found {count} NFL game date sections\n")
-        for i in range(count):
-            section = date_sections.nth(i)
-            date_header = (section.locator("div.Table__Title").text_content() or "").strip()
-            rows = section.locator("tbody tr")
-            for j in range(rows.count()):
-                row = rows.nth(j)
+        collected = []
+        sections_sel, sections = _section_locators(page)
+        if sections.count() == 0:
+            print("⚠️ No sections found; page structure may have changed.")
+            return collected
+
+        # If selector is the whole block, treat it as one section
+        num_sections = sections.count() if sections_sel != "div.ScheduleTables" else 1
+        for i in range(num_sections):
+            section = sections.nth(i) if sections_sel != "div.ScheduleTables" else sections
+            # Date header is optional; if missing, keep empty and rely on kickoff parse later
+            try:
+                date_header = (section.locator(".Table__Title").first.text_content() or "").strip()
+            except Exception:
+                date_header = ""
+            trs = _extract_rows_from_section(section)
+            for row in trs:
                 tds = row.locator("td")
                 if tds.count() < 2:
                     continue
@@ -289,27 +376,24 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                 away_cell = tds.nth(0)
                 home_cell = tds.nth(1)
 
-                away_team = away_cell.locator("span.Table__Team a").nth(1).text_content(timeout=2000).strip()
-                home_team = home_cell.locator("span.Table__Team a").nth(1).text_content(timeout=2000).strip()
-                game_time = tds.nth(2).text_content(timeout=1000).strip() if tds.count() > 2 else "N/A"
+                away_team = _get_team_text(away_cell)
+                home_team = _get_team_text(home_cell)
+                if not away_team or not home_team:
+                    continue
 
-                away_logo_url = away_cell.locator("img").get_attribute("src") or ""
-                home_logo_url = home_cell.locator("img").get_attribute("src") or ""
+                game_time = ""
+                try:
+                    if tds.count() > 2:
+                        game_time = (tds.nth(2).text_content(timeout=800) or "").strip()
+                except Exception:
+                    pass
+
+                away_logo_url = _get_logo_url(away_cell)
+                home_logo_url = _get_logo_url(home_cell)
                 away_logo_formula = get_logo_formula(away_team, away_logo_url, league="nfl")
                 home_logo_formula = get_logo_formula(home_team, home_logo_url, league="nfl")
 
-                line, ou = "N/A", "N/A"
-                if tds.count() > 6:
-                    odds_links = tds.nth(6).locator("a")
-                    for k in range(odds_links.count()):
-                        raw = odds_links.nth(k).text_content(timeout=1000).strip()
-                        t = raw.lower().replace("\u00bd", ".5")
-                        if t.startswith("line:") or t.startswith("spread:"):
-                            line = raw.split(":", 1)[-1].strip()
-                        elif t.startswith("o/u:") or t.startswith("total:"):
-                            ou = raw.split(":", 1)[-1].strip()
-                        elif re.match(r"^[A-Za-z]{2,4}\s*[+-]\d+(\.\d+)?$", raw):
-                            line = raw.strip()
+                line, ou = _parse_odds_cells(tds)
 
                 def resolve_abbreviation_by_logo(team_name, logo_url):
                     u = (logo_url or "").lower()
@@ -323,17 +407,17 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                 home_abbr = resolve_abbreviation_by_logo(home_team, home_logo_url)
 
                 away_line = home_line = "N/A"
-                if line != "N/A":
+                if line != "N/A" and away_abbr and home_abbr:
                     parts = line.split()
                     if len(parts) == 2:
                         favored_abbr, raw_spread = parts
                         try:
                             spread = float(raw_spread.replace("+", "").replace("-", ""))
                             spread_str = f"{spread:.1f}".rstrip('0').rstrip('.')
-                            if favored_abbr == away_abbr:
+                            if favored_abbr.upper() == away_abbr:
                                 away_line = f"{away_abbr} -{spread_str}"
                                 home_line = f"{home_abbr} +{spread_str}"
-                            elif favored_abbr == home_abbr:
+                            elif favored_abbr.upper() == home_abbr:
                                 home_line = f"{home_abbr} -{spread_str}"
                                 away_line = f"{away_abbr} +{spread_str}"
                         except ValueError:
@@ -342,40 +426,52 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                 ou_top = f"O {ou}" if ou != "N/A" else "N/A"
                 ou_bottom = f"U {ou}" if ou != "N/A" else "N/A"
 
-                data.append([away_logo_formula, away_team, "", away_line, "", ou_top, date_header, game_time])
-                data.append([home_logo_formula, home_team, "", home_line, "", ou_bottom, date_header, game_time])
-        return data
+                collected.append([away_logo_formula, away_team, "", away_line, "", ou_top, date_header, game_time])
+                collected.append([home_logo_formula, home_team, "", home_line, "", ou_bottom, date_header, game_time])
+
+        print(f"Collected NFL rows: {len(collected)}")
+        return collected
 
     tz = ZoneInfo(TIMEZONE)
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url, timeout=60000)
-        page.wait_for_selector("div.ScheduleTables", timeout=20000)
+        page.wait_for_selector("body", timeout=15000)
 
         rows = collect_from_current_page(page)
 
-        # If every parsed kickoff < this week's Monday, ESPN is still showing last week -> click "Next Week" once
-        this_mon = _football_week_monday(datetime.now(tz))
+        # If we got nothing OR everything is before this week's Monday, try advancing a week once.
+        this_mon = (datetime.now(tz) - timedelta(days=datetime.now(tz).weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
 
-        def _all_before_this_week(rows):
+        def all_before_this_week(rws):
             kicks = []
-            for i in range(0, len(rows), 2):
-                dt = parse_kickoff_local(rows[i][6], rows[i][7], TIMEZONE)  # uses away row; home is same
+            for i in range(0, len(rws), 2):
+                dt = parse_kickoff_local(rws[i][6], rws[i][7], TIMEZONE)
                 if dt:
                     kicks.append(dt)
-            return bool(kicks) and all(k < this_mon for k in kicks)
+            return len(rws) > 0 and kicks and all(k < this_mon for k in kicks)
 
-        if _all_before_this_week(rows):
+        try_advance = False
+        if len(rows) == 0:
+            print("No NFL rows found; will try advancing to next week once.")
+            try_advance = True
+        elif all_before_this_week(rows):
+            print("NFL rows exist but appear to be last week; will try advancing to next week once.")
+            try_advance = True
+
+        if try_advance:
             try:
-                nxt = page.locator("button[aria-label='Next Week']")
-                if nxt.count() > 0:
-                    nxt.first.click()
-                    page.wait_for_selector("div.ScheduleTables", timeout=20000)
+                next_btn = page.locator("button[aria-label='Next Week'], a[aria-label='Next Week']")
+                if next_btn.count() > 0:
+                    next_btn.first.click()
+                    page.wait_for_selector("body", timeout=15000)
                     rows = collect_from_current_page(page)
-                    print("⚠️ ESPN showed previous week; advanced to next week automatically.")
-            except Exception:
-                pass
+                    print("Advanced one week and re-scraped.")
+            except Exception as e:
+                print(f"Advance failed (continuing with current page): {e}")
 
         browser.close()
         return rows
