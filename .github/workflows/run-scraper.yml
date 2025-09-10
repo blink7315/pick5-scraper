@@ -1,7 +1,7 @@
 name: Run pick5 scraper
 
 on:
-  workflow_dispatch: {}   # manual trigger only (no automation)
+  workflow_dispatch: {}   # manual trigger (you can add a schedule later)
 
 concurrency:
   group: pick5-scraper
@@ -39,8 +39,7 @@ jobs:
           COLLEGE_SHEET_ID: ${{ secrets.COLLEGE_SHEET_ID }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           PYTHONUNBUFFERED: "1"
-          HEADLESS: "1"            # ← add this line
-          SKIP_PURGE: "1"      # ← add this line
+          HEADLESS: "1"               # keep headless browser
+          FORCE_WEEK_TABLE: "1"       # Step 14: always use deterministic NFL week mapping
+          SKIP_PURGE: "0"             # Step 10: purge safely re-enabled (write & purge share WeekTag)
         run: python pick5_scraper.py
-
-
