@@ -9,7 +9,7 @@ if not PICK_SHEET_ID or not COLLEGE_SHEET_ID:
 
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
 from playwright.sync_api import sync_playwright
@@ -58,13 +58,33 @@ A1_RANGE_RE = re.compile(r"^(?:[^!]+!)?([A-Z]+)(\d+):([A-Z]+)(\d+)$")
 SPACER_ROWS_BETWEEN_LEAGUES = 4
 
 def week_tag_explicit(league: str, kickoff_dt: datetime | None):
-    # Prefer explicit ESPN week if provided; fall back to dates only if not set.
+    """
+    Prefer explicit week inputs/overrides; otherwise:
+      - NFL: use our deterministic Tue→Mon mapping (Step 1)
+      - CFB: unchanged (only use explicit CFB_WEEK if provided)
+    """
+    # --- CFB: unchanged behavior ---
     if league == "ncaaf" and CFB_WEEK is not None:
         yr = CFB_YEAR or (kickoff_dt.year if kickoff_dt else datetime.now(ZoneInfo(TIMEZONE)).year)
         return f"{yr}-CFB-Wk{CFB_WEEK}"
+
+    # --- NFL: honor explicit overrides first ---
     if league == "nfl" and NFL_WEEK is not None:
         yr = NFL_YEAR or (kickoff_dt.year if kickoff_dt else datetime.now(ZoneInfo(TIMEZONE)).year)
         return f"{yr}-NFL-Wk{NFL_WEEK}"
+
+    # NFL fallback: resolve from our Tue→Mon table (2025 season)
+    if league == "nfl":
+        # Use the kickoff date if available; otherwise fall back to *today* in local TZ
+        if kickoff_dt is not None:
+            local_d = kickoff_dt.astimezone(ZoneInfo(TIMEZONE)).date()
+        else:
+            local_d = datetime.now(ZoneInfo(TIMEZONE)).date()
+        season_year, wk = resolve_nfl_week_year_by_table(local_d)
+        if wk is not None:
+            return f"{season_year}-NFL-Wk{wk}"
+
+    # No explicit week tag; let compute_week_tag() handle it downstream
     return None
 
 def _a1_last_row(a1_range: str) -> int:
@@ -281,7 +301,48 @@ def _int_or_none(s: str):
         return int(s)
     except Exception:
         return None
-# <<< ADD THIS BLOCK <<<
+
+# --- NFL 2025 Tue→Mon week windows (America/Detroit, inclusive) ---
+# NOTE: ESPN URL "year" stays the SEASON year (2025) even when the window ends in Jan 2026.
+NFL_WEEK_WINDOWS_2025 = [
+    (date(2025, 9,  2), date(2025, 9,  8),  1),
+    (date(2025, 9,  9), date(2025, 9, 15),  2),
+    (date(2025, 9, 16), date(2025, 9, 22),  3),
+    (date(2025, 9, 23), date(2025, 9, 29),  4),
+    (date(2025, 9, 30), date(2025, 10,  6), 5),
+    (date(2025, 10,  7), date(2025, 10, 13), 6),
+    (date(2025, 10, 14), date(2025, 10, 20), 7),
+    (date(2025, 10, 21), date(2025, 10, 27), 8),
+    (date(2025, 10, 28), date(2025, 11,  3), 9),
+    (date(2025, 11,  4), date(2025, 11, 10), 10),
+    (date(2025, 11, 11), date(2025, 11, 17), 11),
+    (date(2025, 11, 18), date(2025, 11, 24), 12),
+    (date(2025, 11, 25), date(2025, 12,  1), 13),
+    (date(2025, 12,  2), date(2025, 12,  8), 14),
+    (date(2025, 12,  9), date(2025, 12, 15), 15),
+    (date(2025, 12, 16), date(2025, 12, 22), 16),
+    (date(2025, 12, 23), date(2025, 12, 29), 17),
+    (date(2025, 12, 30), date(2026,  1,  5), 18),
+]
+
+def _nfl_week_from_local_date_2025(d: date) -> tuple[int | None, int | None]:
+    """
+    Return (season_year, week) for the given local date using the fixed Tue→Mon
+    windows for the 2025 NFL regular season. If no window matches, returns (None, None).
+    """
+    for start, end, wk in NFL_WEEK_WINDOWS_2025:
+        if start <= d <= end:
+            return 2025, wk
+    return None, None
+
+def resolve_nfl_week_year_by_table(today_local: date | None = None) -> tuple[int | None, int | None]:
+    """
+    Determine (NFL_YEAR, NFL_WEEK) deterministically from our local Tue→Mon table.
+    Currently implements 2025 season mapping only.
+    """
+    local_d = today_local or datetime.now(ZoneInfo(TIMEZONE)).date()
+    season_year, week = _nfl_week_from_local_date_2025(local_d)
+    return season_year, week
 
 # =========================
 # === SCRAPERS (8-col A..H output) ===
@@ -295,13 +356,34 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
     print("Launching browser and scraping NFL schedule...")
     base_url = "https://www.espn.com/nfl/schedule"
     # >>> REPLACE THIS WHOLE url BLOCK >>>
-    if week is not None:
-        # explicit URL wins
-        url = f"{base_url}/_/week/{week}" + (f"/year/{year}" if year is not None else "")
+    # Resolve final (year, week) in this priority:
+    #  1) Function args (year/week) passed in
+    #  2) Deterministic Tue→Mon table (Step 1)
+    #  3) Fallback: leave week None and let DOM/fallback probes handle it
+    resolved_year = year
+    resolved_week = week
+
+    if resolved_week is None:
+        # Deterministic mapping for 2025 season
+        today_local = datetime.now(ZoneInfo(TIMEZONE)).date()
+        tab_year, tab_week = resolve_nfl_week_year_by_table(today_local)
+        if tab_week is not None:
+            resolved_year = tab_year
+            resolved_week = tab_week
+
+    if resolved_week is not None:
+        # Always hit the explicit ESPN week URL when we have a table/arg week
+        url = f"{base_url}/_/week/{resolved_week}/year/{resolved_year or _season_year_for_date(datetime.now(ZoneInfo(TIMEZONE)))}"
+        print(f"DEBUG resolved NFL via table/args -> YEAR/WEEK: {resolved_year}/{resolved_week}")
+        print(f"DEBUG target NFL URL: {url}")
     else:
-        # start at base; we’ll detect week/year and then jump to the explicit URL
+        # No table match (e.g., out of season) → start at base and let existing logic probe
         url = base_url
+        print("DEBUG no table week match; starting at base and relying on DOM/probes.")
     # <<< END REPLACE <<<
+    print(f"DEBUG using NFL_YEAR={resolved_year}, NFL_WEEK={resolved_week}")
+    print(f"DEBUG initial target URL (pre-nav): {url}")
+
 
     TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*[AP]M\b", re.IGNORECASE)
 
@@ -368,6 +450,9 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                     line = raw.split(":", 1)[-1].strip()
                 elif t.startswith("o/u:") or t.startswith("total:"):
                     ou = raw.split(":", 1)[-1].strip()
+                elif re.match(r"^(?:o/u|total)\s*:?\s*(\d+(?:\.\d+)?)\b", t):
+                    m2 = re.match(r"^(?:o/u|total)\s*:?\s*(\d+(?:\.\d+)?)\b", t)
+                    ou = m2.group(1)
                 elif re.match(r"^[A-Za-z]{2,4}\s*[+-]\d+(\.\d+)?$", raw):
                     line = raw.strip()
         except Exception:
@@ -380,6 +465,7 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
         if sections.count() == 0:
             return rows_out
         num_sections = sections.count() if sections_sel != "div.ScheduleTables" else 1
+        print(f"DEBUG sections: {num_sections} via selector='{sections_sel or 'tbody'}'")
         for i in range(num_sections):
             section = sections.nth(i) if sections_sel != "div.ScheduleTables" else sections
             try:
@@ -395,6 +481,19 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                 home_team = _get_team_text(home_cell)
                 if not away_team or not home_team:
                     continue
+                # >>> INSERT: skip non-game rows (BYE/header echoes) >>>
+                at = away_team.strip().upper()
+                ht = home_team.strip().upper()
+                # ESPN sometimes renders BYE/headers in the first two cells
+                if at == "BYE" or ht == "BYE":
+                    continue
+                # Defensive: ignore rows where both cells echo the same header-like token
+                if at == ht:
+                    continue
+                # Common header tokens that can leak into cells
+                if at in ("MATCHUP", "GAME") or ht in ("MATCHUP", "GAME"):
+                    continue
+                # <<< END INSERT <<<
 
                 # Robust time scan + aria-label fallback; skip if still missing
                 game_time = _scan_time_from_row(row)
@@ -467,7 +566,6 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
     week_end = week_start + timedelta(days=7)
 
     print(f"DEBUG week window local: {week_start.strftime('%Y-%m-%d %H:%M')} → {week_end.strftime('%Y-%m-%d %H:%M')} ({TIMEZONE})")
-    print(f"DEBUG initial target URL: {url}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -526,22 +624,23 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
             else:
                 print("DEBUG: no reliable week detected; skipping direct jump, will probe weeks 1..23.")
 
-            # >>> INSERT: nudge virtualization to mount rows >>>
+            # >>> REPLACE: stronger virtualization nudge >>>
             try:
-                page.mouse.wheel(0, 400)
-                page.wait_for_timeout(150)
-                page.mouse.wheel(0, -400)
-                page.wait_for_timeout(150)
+                for _ in range(2):
+                    page.mouse.wheel(0, 600); page.wait_for_timeout(220)
+                    page.mouse.wheel(0, -600); page.wait_for_timeout(220)
+                # tiny jitter to trip IntersectionObservers
+                page.mouse.wheel(0, 1); page.wait_for_timeout(60)
             except Exception:
                 pass
-            # <<< END INSERT <<<
+            # <<< END REPLACE <<<
 
             # also ensure at least one row is mounted
             page.wait_for_function(
                 """() => !!document.querySelector("tbody tr, tr.Table__TR, [role='row']")""",
                 timeout=10000
             )
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(500)
         # <<< END INSERT <<<
 
         page.wait_for_selector("body", timeout=15000)
@@ -563,6 +662,8 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
             pass
         # <<< END INSERT <<<
        
+        print(f"DEBUG final page URL (pre-collect): {page.url}")
+
         snapshots = []
 
         # current
@@ -613,8 +714,64 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
 
         best_hits, best_name, best_rows = scored[0] if scored else (0, "current", cur)
         print(f"Chosen snapshot: {best_name} (hits={best_hits})")
+
+        # >>> INSERT: zero in-window diagnostic dump (before fallback) >>>
+        if best_hits == 0:
+            try:
+                sel = "div.ScheduleTables, .ScheduleTables"
+                page.wait_for_selector(sel, state="visible", timeout=3000)
+                snippet = page.inner_text(sel, timeout=2000)
+            except Exception:
+                try:
+                    snippet = page.inner_text("body", timeout=2000)
+                except Exception:
+                    snippet = ""
+            snippet = (snippet or "").replace("\n", " ")[:300]
+            print(f"DEBUG 0 in-window; first 300 chars of table area: {snippet!r}")
+        # <<< END INSERT <<<
+
         # --- Fallback: brute-force weeks if we still have 0 hits --------------------
         if best_hits == 0:
+            # >>> INSERT: quick explicit ±1 week probe when we have a resolved week >>>
+            try:
+                if 'resolved_week' in locals() and resolved_week is not None:
+                    season_year_quick = (resolved_year
+                                        if 'resolved_year' in locals() and resolved_year is not None
+                                        else _season_year_for_date(datetime.now(ZoneInfo(TIMEZONE))))
+                    def _collect_for_explicit(w):
+                        if w < 1 or w > 23:
+                            return 0, [], w
+                        try:
+                            explicit = f"{base_url}/_/week/{w}/year/{season_year_quick}"
+                            print(f"DEBUG quick-probe: {explicit}")
+                            page.goto(explicit, timeout=60000)
+                            page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000)
+                            try:
+                                page.mouse.wheel(0, 600); page.wait_for_timeout(180)
+                                page.mouse.wheel(0, -600); page.wait_for_timeout(180)
+                            except Exception:
+                                pass
+                            rows = _collect_from_page(page)
+                            hits = _rows_in_window(rows, week_start, week_end)
+                            print(f"DEBUG quick-probe week {w}: {hits} in-window out of {len(rows)} rows")
+                            return hits, rows, w
+                        except Exception:
+                            return 0, [], w
+
+                    qhits_best, qrows_best, qw_best = 0, [], None
+                    for w in (resolved_week - 1, resolved_week + 1):
+                        h, r, wnum = _collect_for_explicit(w)
+                        if h > qhits_best:
+                            qhits_best, qrows_best, qw_best = h, r, wnum
+
+                    if qhits_best > 0:
+                        print(f"DEBUG quick-probe chose week {qw_best} with {qhits_best} hits.")
+                        browser.close()
+                        return qrows_best
+            except Exception:
+                pass
+            # <<< END INSERT <<<
+
             print("DEBUG fallback: probing explicit week URLs 1..23 for the current season…")
             now_local = datetime.now(ZoneInfo(TIMEZONE))
             season_year = _season_year_for_date(now_local)
@@ -655,6 +812,7 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
 
 
         browser.close()
+        print(f"✅ NFL scrape complete — collected {len(best_rows)//2} games ({len(best_rows)} rows).")
         return best_rows
 
 def _normalize_name(s: str) -> str:
@@ -702,6 +860,10 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
 
         date_sections = page.locator("div.ScheduleTables--ncaaf")
         print(f"✅ Found {date_sections.count()} game date sections\n")
+        if not COLLEGE_INCLUDE_ALL:
+            print("Top-25 filter active (only games with at least one ranked team).")
+
+
 
         for i in range(date_sections.count()):
             section = date_sections.nth(i)
@@ -713,7 +875,12 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
                 continue
 
             rows = section.locator("tr.Table__TR")
-            print(f"  - Found {rows.count()} rows total")
+            count_rows = rows.count()
+            print(f"  - Found {count_rows} rows total")
+            if count_rows == 0:
+                print("  - Skipping empty section (duplicate header / no rows).")
+                continue
+            kept_this_section = 0
 
             for j in range(rows.count()):
                 row = rows.nth(j)
@@ -736,6 +903,8 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
 
                     if not COLLEGE_INCLUDE_ALL and (away_rank is None and home_rank is None):
                         continue
+                    # Count games that survive the Top-25 filter (once per matchup)
+                    kept_this_section += 1
 
                     line, ou = "N/A", "N/A"
                     if tds.count() > 6:
@@ -792,8 +961,11 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
 
                 except Exception:
                     continue
+            if not COLLEGE_INCLUDE_ALL:
+                print(f"  - Kept {kept_this_section} games after Top-25 filter")
 
         browser.close()
+        print(f"✅ College scrape complete — collected {len(all_data)//2} games ({len(all_data)} rows).")
         return all_data
 
 # =========================
@@ -823,7 +995,16 @@ def parse_kickoff_local(date_text: str, time_text: str, tzname: str) -> datetime
         m = re.search(r"([A-Za-z]+)\s+(\d{1,2})", date_text)
         if not m:
             return None
-        month, day = m.group(1), int(m.group(2))
+        month, day = m.group(1).strip(), int(m.group(2))
+        # Normalize common month abbreviations (with/without trailing period)
+        mon_token = month.rstrip(".")
+        MONTH_ALIASES = {
+            "Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April", "May": "May",
+            "Jun": "June", "Jul": "July", "Aug": "August", "Sep": "September", "Sept": "September",
+            "Oct": "October", "Nov": "November", "Dec": "December",
+        }
+        full_month = MONTH_ALIASES.get(mon_token, month)
+
         # Normalize odd spacings like "A M" / "P  M", NBSPs, double spaces
         tt = (time_text or "").replace("\u00a0", " ").upper()
         tt = re.sub(r"\s+", " ", tt).strip()
@@ -836,10 +1017,14 @@ def parse_kickoff_local(date_text: str, time_text: str, tzname: str) -> datetime
         timestr = f"{t.group(1)}{t.group(2)}"
         now = datetime.now(ZoneInfo(tzname))
         year = now.year
-        month_num = datetime.strptime(month, "%B").month
+        try:
+            month_num = datetime.strptime(full_month, "%B").month
+        except ValueError:
+            # Fallback: parse abbreviated month (e.g., "Sep")
+            month_num = datetime.strptime(mon_token, "%b").month
         if now.month >= 11 and month_num <= 2:
             year = now.year + 1
-        dt = datetime.strptime(f"{month} {day} {year} {timestr}", "%B %d %Y %I:%M%p").replace(tzinfo=ZoneInfo(tzname))
+        dt = datetime.strptime(f"{full_month} {day} {year} {timestr}", "%B %d %Y %I:%M%p").replace(tzinfo=ZoneInfo(tzname))
         if (now - dt).days > 180:
             dt = dt.replace(year=dt.year + 1)
         return dt
@@ -1010,8 +1195,15 @@ def _purge_lines_to_current_week(spreadsheet, now_dt: datetime, phase_cfb: str, 
         if not k or not (week_start <= k < week_end):
             to_delete_tops.append(top)
 
+    # >>> INSERT: purge accounting >>>
+    total_pairs = max((len(vals) - 1) // 2, 0)
+    deleted_pairs = len(to_delete_tops)
+    kept_pairs = max(total_pairs - deleted_pairs, 0)
+    # <<< END INSERT <<<
+
     if not to_delete_tops:
-        print("Purge: nothing to delete (current-week filter).")
+        print(f"Purge: nothing to delete — kept {kept_pairs}/{total_pairs} pairs for current week "
+              f"{week_start.strftime('%Y-%m-%d')}→{week_end.strftime('%Y-%m-%d')}.")
         return
 
     # group contiguous 2-row blocks and delete bottom-up
@@ -1029,7 +1221,8 @@ def _purge_lines_to_current_week(spreadsheet, now_dt: datetime, phase_cfb: str, 
     for s, e in reversed(blocks):
         lines_ws.delete_rows(s, e)
 
-    print("Purge: completed (kept only current football week).")
+    print(f"Purge: deleted {deleted_pairs} pair(s); kept {kept_pairs}/{total_pairs} for current week "
+        f"{week_start.strftime('%Y-%m-%d')}→{week_end.strftime('%Y-%m-%d')}.")
 
 def queue_pair_range(ws_title: str, top_row: int, full_away: list, full_home: list):
     """
@@ -1148,6 +1341,7 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
                 index[gk] = r
 
     games = pack_pairs_to_games(staging_rows)
+    seen_in_batch = set()
 
     def fmt(dt):
         return dt.astimezone(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M") if dt else ""
@@ -1166,6 +1360,12 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
         release_at, freeze_at = compute_release_freeze(kickoff_dt, league, phase)
         week_tag = week_tag_explicit(league, kickoff_dt) or compute_week_tag(kickoff_dt, league, phase)
         game_key = make_game_key(kickoff_dt, g["away_team_disp"], g["home_team_disp"], espn_game_id=None)
+        # >>> INSERT: skip duplicate GameKey within this batch >>>
+        if game_key in seen_in_batch:
+            print(f"DEBUG duplicate game in batch (skipped): {game_key}")
+            continue
+        seen_in_batch.add(game_key)
+        # <<< END INSERT <<<
 
         locked_flag = "N"
         status = "placeholder"
@@ -1332,6 +1532,22 @@ if __name__ == "__main__":
     if include_nfl:
         print("Running NFL scraper...")
         print(f"Using NFL year/week: {NFL_YEAR}/{NFL_WEEK} (overridden={bool(os.environ.get('NFL_YEAR_OVERRIDE') or os.environ.get('NFL_WEEK_OVERRIDE'))})")
+
+        # >>> INSERT: NFL week-tag source preview >>>
+        try:
+            now_local = datetime.now(ZoneInfo(TIMEZONE))
+            if NFL_WEEK is not None or NFL_YEAR is not None:
+                src = "override/args"
+                prev_year = NFL_YEAR or _season_year_for_date(now_local)
+                prev_week = NFL_WEEK
+            else:
+                prev_year, prev_week = resolve_nfl_week_year_by_table(now_local.date())
+                src = "table" if prev_week is not None else "fallback"
+            print(f"DEBUG NFL week-tag source: {src}; season={prev_year}, week={prev_week}")
+        except Exception as e:
+            print(f"DEBUG NFL week-tag preview failed: {e}")
+        # <<< END INSERT <<<
+
         nfl_rows = scrape_nfl_schedule(year=NFL_YEAR, week=NFL_WEEK)
 
     if include_college:
