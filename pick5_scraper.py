@@ -510,12 +510,22 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                 # ESPN's “week” numbering isn’t ISO; but jumping to an explicit week URL is still safer than the active page.
                 # If this guess is off by 1, our prev/next snapshot below will still recover.
                 detected_week = thursday.isocalendar().week  # best-effort anchor
+                # Clamp to NFL's sane range; if out of range, force brute-force later
+                if detected_week is not None and not (1 <= detected_week <= 23):
+                    detected_week = None
 
-            explicit_url = f"{base_url}/_/week/{detected_week}/year/{detected_year}"
-            print(f"DEBUG forcing explicit NFL URL: {explicit_url}")
-            page.goto(explicit_url, timeout=60000)
-            # Strong readiness: container + any row-like element
-            page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=30000)
+            if detected_week is not None:
+                explicit_url = f"{base_url}/_/week/{detected_week}/year/{detected_year}"
+                print(f"DEBUG forcing explicit NFL URL: {explicit_url}")
+                page.goto(explicit_url, timeout=60000)
+                # Strong readiness: try the container, but don’t die if ESPN serves a blank variant
+                try:
+                    page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=12000)
+                except Exception:
+                    print("DEBUG: schedule container not visible on forced URL; will rely on brute-force probe.")
+            else:
+                print("DEBUG: no reliable week detected; skipping direct jump, will probe weeks 1..23.")
+
             # >>> INSERT: nudge virtualization to mount rows >>>
             try:
                 page.mouse.wheel(0, 400)
@@ -535,7 +545,13 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
         # <<< END INSERT <<<
 
         page.wait_for_selector("body", timeout=15000)
-        page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=30000)
+        page.wait_for_selector("body", timeout=15000)
+        try:
+            page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=12000)
+        except Exception:
+            print("DEBUG: container not visible; proceeding (fallback probe or row-scan may still succeed).")
+        page.wait_for_timeout(500)
+
         page.wait_for_timeout(500)
                 # >>> INSERT: require at least one row-like element before we start collecting >>>
         try:
