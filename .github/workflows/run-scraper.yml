@@ -39,6 +39,7 @@ jobs:
           COLLEGE_SHEET_ID: ${{ secrets.COLLEGE_SHEET_ID }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           PYTHONUNBUFFERED: "1"
+          HEADLESS: "1"            # ← add this line
         run: python pick5_scraper.py
 
 
