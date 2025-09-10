@@ -1,7 +1,12 @@
 name: Run pick5 scraper
 
 on:
-  workflow_dispatch: {}   # manual trigger (you can add a schedule later)
+  workflow_dispatch: {}
+  schedule:
+    # 21:00 UTC ~= 5pm ET during Daylight Time
+    - cron: "0 21 * * 2,4"
+    # 22:00 UTC ~= 5pm ET during Standard Time
+    - cron: "0 22 * * 2,4"
 
 concurrency:
   group: pick5-scraper
@@ -16,30 +21,44 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
+      - name: Guard: only run at 5pm America/Detroit
+        id: timeguard
+        run: |
+          DET_HOUR=$(TZ=America/Detroit date +%H)
+          DET_DOW=$(TZ=America/Detroit date +%u)   # 1=Mon ... 7=Sun
+          if [ "$DET_HOUR" != "17" ] || { [ "$DET_DOW" != "2" ] && [ "$DET_DOW" != "4" ]; }; then
+            echo "Not Tue/Thu 5pm Detroit (current Detroit hour=$DET_HOUR, dow=$DET_DOW). Exiting."
+            exit 0
+          fi
+
       - name: Set up Python
+        if: success()    # still runs after guard (which exited 0 when skipping)
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies (Python + Playwright)
+        if: success()
         run: |
           python -m pip install --upgrade pip
           pip install playwright gspread google-auth gspread-formatting
           playwright install --with-deps chromium
 
       - name: Write Google service account file
+        if: success()
         run: |
           cat > credentials.json <<'JSON'
           ${{ secrets.GOOGLE_SA_JSON }}
           JSON
 
       - name: Run scraper
+        if: success()
         env:
           PICK_SHEET_ID: ${{ secrets.PICK_SHEET_ID }}
           COLLEGE_SHEET_ID: ${{ secrets.COLLEGE_SHEET_ID }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           PYTHONUNBUFFERED: "1"
-          HEADLESS: "1"               # keep headless browser
-          FORCE_WEEK_TABLE: "1"       # Step 14: always use deterministic NFL week mapping
-          SKIP_PURGE: "0"             # Step 10: purge safely re-enabled (write & purge share WeekTag)
+          HEADLESS: "1"
+          FORCE_WEEK_TABLE: "1"
+          SKIP_PURGE: "0"
         run: python pick5_scraper.py
