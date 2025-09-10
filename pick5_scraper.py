@@ -1,3 +1,45 @@
+"""
+==========================================================
+ Football Pool Scraper — NFL Week-Date Mapping (2025 Season)
+==========================================================
+
+This project uses a deterministic Tue→Mon mapping for NFL weeks.
+We DO NOT rely on ESPN’s shifting “active” week logic because we
+need lines earlier in the week for publishing.
+
+Rule of thumb for season year:
+  - Games in Sep–Dec → same calendar year.
+  - Games in Jan–Aug → previous calendar year.
+
+Regular Season 2025 (all Tue 00:00 local → next Tue 00:00 local):
+  Week 1:  Sep  2, 2025 – Sep  8, 2025
+  Week 2:  Sep  9, 2025 – Sep 15, 2025
+  Week 3:  Sep 16, 2025 – Sep 22, 2025
+  Week 4:  Sep 23, 2025 – Sep 29, 2025
+  Week 5:  Sep 30, 2025 – Oct  6, 2025
+  Week 6:  Oct  7, 2025 – Oct 13, 2025
+  Week 7:  Oct 14, 2025 – Oct 20, 2025
+  Week 8:  Oct 21, 2025 – Oct 27, 2025
+  Week 9:  Oct 28, 2025 – Nov  3, 2025
+  Week 10: Nov  4, 2025 – Nov 10, 2025
+  Week 11: Nov 11, 2025 – Nov 17, 2025
+  Week 12: Nov 18, 2025 – Nov 24, 2025
+  Week 13: Nov 25, 2025 – Dec  1, 2025
+  Week 14: Dec  2, 2025 – Dec  8, 2025
+  Week 15: Dec  9, 2025 – Dec 15, 2025
+  Week 16: Dec 16, 2025 – Dec 22, 2025
+  Week 17: Dec 23, 2025 – Dec 29, 2025
+  Week 18: Dec 30, 2025 – Jan  5, 2026
+
+Notes:
+- Playoffs are NOT mapped here. Handle them separately.
+- The mapping should be extended each new season.
+- If a kickoff date doesn’t fall inside any range,
+  scraper falls back to prev/next or brute-force probe.
+
+==========================================================
+"""
+
 import os
 
 # Read from GitHub Secrets (set in the workflow env)
