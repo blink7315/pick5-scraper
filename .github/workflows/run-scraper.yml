@@ -65,7 +65,7 @@ jobs:
       - name: Run scraper
         env:
           PICK_SHEET_ID: ${{ secrets.PICK_SHEET_ID }}
-          COLLEGE_SHEET_ID: ${{ secrets.COLL EGE_SHEET_ID }}
+          COLLEGE_SHEET_ID: ${{ secrets.COLLEGE_SHEET_ID }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           PYTHONUNBUFFERED: "1"
         run: python pick5_scraper.py
