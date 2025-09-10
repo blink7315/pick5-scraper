@@ -3,6 +3,9 @@ name: Run pick5 scraper
 on:
   workflow_dispatch: {}
   schedule:
+    # 5:00 PM America/Detroit is:
+    #  - 21:00 UTC during EDT (spring/summer)
+    #  - 22:00 UTC during EST (fall/winter)
     - cron: "0 21 * * 2,4"  # Tue/Thu 5pm EDT
     - cron: "0 22 * * 2,4"  # Tue/Thu 5pm EST
 
@@ -36,19 +39,33 @@ jobs:
           ${{ secrets.GOOGLE_SA_JSON }}
           JSON
 
-      # Double-check local time, so both crons only run at 5pm Detroit
-      - name: Gate to 5pm America/Detroit
+      # Guard so the job only proceeds at Tue/Thu 17:00 America/Detroit,
+      # even though we schedule two UTC crons to span DST.
+      - name: Guard: run only Tue/Thu 17:00 America/Detroit
+        shell: bash
         run: |
-          DET_HOUR=$(TZ=America/Detroit date +%H)
-          if [ "$DET_HOUR" != "17" ]; then
-            echo "Not 5pm Detroit (hour=$DET_HOUR). Exiting without running."
+          TZ="America/Detroit"
+          DOW="$(TZ=$TZ date +%u)"   # 1=Mon .. 7=Sun
+          HOUR="$(TZ=$TZ date +%H)"  # 00..23
+          NOW_LOCAL="$(TZ=$TZ date)"
+          if [[ ! (("$DOW" == "2" || "$DOW" == "4") && "$HOUR" == "17") ]]; then
+            echo "Skipping run — local time is not Tue/Thu 17:00 in America/Detroit."
+            echo "Now (America/Detroit): $NOW_LOCAL"
             exit 0
           fi
+          echo "Proceeding — it is Tue/Thu 17:00 America/Detroit."
+          echo "Now (America/Detroit): $NOW_LOCAL"
+
+      - name: Log start (local + UTC)
+        run: |
+          echo "Starting Football Pool scrape…"
+          echo "UTC now:     $(date -u)"
+          echo "Detroit now: $(TZ=America/Detroit date)"
 
       - name: Run scraper
         env:
           PICK_SHEET_ID: ${{ secrets.PICK_SHEET_ID }}
-          COLLEGE_SHEET_ID: ${{ secrets.COLLEGE_SHEET_ID }}
+          COLLEGE_SHEET_ID: ${{ secrets.COLL EGE_SHEET_ID }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           PYTHONUNBUFFERED: "1"
         run: python pick5_scraper.py
