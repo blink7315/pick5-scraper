@@ -1,7 +1,10 @@
 name: Run pick5 scraper
 
 on:
-  workflow_dispatch: {}   # manual trigger only (no automation)
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 21 * * 2,4"  # 5pm ET during Daylight Time (21:00 UTC)
+    - cron: "0 22 * * 2,4"  # 5pm ET during Standard Time (22:00 UTC)
 
 concurrency:
   group: pick5-scraper
@@ -39,6 +42,7 @@ jobs:
           COLLEGE_SHEET_ID: ${{ secrets.COLLEGE_SHEET_ID }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           PYTHONUNBUFFERED: "1"
-          HEADLESS: "1"            # ← add this line
-          SKIP_PURGE: "1"          # ← add this line
+          HEADLESS: "1"
+          FORCE_WEEK_TABLE: "1"
+          SKIP_PURGE: "0"
         run: python pick5_scraper.py
