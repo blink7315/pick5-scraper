@@ -269,6 +269,20 @@ def find_abbreviation(team_name, logo_url=""):
                 return abbr
     return None
 
+# >>> ADD THIS BLOCK (above scrape_nfl_schedule) >>>
+def _season_year_for_date(dt: datetime) -> int:
+    """
+    NFL season year: Sep–Dec -> same year; Jan–Aug -> previous year.
+    """
+    return dt.year if dt.month >= 9 else dt.year - 1
+
+def _int_or_none(s: str):
+    try:
+        return int(s)
+    except Exception:
+        return None
+# <<< ADD THIS BLOCK <<<
+
 # =========================
 # === SCRAPERS (8-col A..H output) ===
 # =========================
@@ -280,10 +294,14 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
     """
     print("Launching browser and scraping NFL schedule...")
     base_url = "https://www.espn.com/nfl/schedule"
-    url = (
-        f"{base_url}/_/week/{week}" + (f"/year/{year}" if (week is not None and year is not None) else "")
-        if week is not None else base_url
-    )
+    # >>> REPLACE THIS WHOLE url BLOCK >>>
+    if week is not None:
+        # explicit URL wins
+        url = f"{base_url}/_/week/{week}" + (f"/year/{year}" if year is not None else "")
+    else:
+        # start at base; we’ll detect week/year and then jump to the explicit URL
+        url = base_url
+    # <<< END REPLACE <<<
 
     TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*[AP]M\b", re.IGNORECASE)
 
@@ -389,8 +407,8 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                     except Exception:
                         pass
                 if not game_time:
-                    # no visible time -> don't include; prevents week-window false negatives
-                    continue
+                    game_time = "N/A"
+
 
                 away_logo_url = _get_logo_url(away_cell)
                 home_logo_url = _get_logo_url(home_cell)
@@ -449,15 +467,85 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
     week_end = week_start + timedelta(days=7)
 
     print(f"DEBUG week window local: {week_start.strftime('%Y-%m-%d %H:%M')} → {week_end.strftime('%Y-%m-%d %H:%M')} ({TIMEZONE})")
-    print(f"DEBUG target URL: {url}")
+    print(f"DEBUG initial target URL: {url}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url, timeout=60000)
+        # >>> INSERT: force explicit week when none was provided >>>
+        if week is None:
+            # Try to read the selected week from the page (week picker/tab)
+            # Fall back to computing week/year deterministically.
+            try:
+                page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000)
+            except Exception:
+                pass
+
+            # Attempt DOM-based detection of week text like "Week 2"
+            detected_week = None
+            detected_year = None
+
+            try:
+                # common patterns: selected tab has aria-current or a selected class
+                candidates = page.locator("[aria-current='true'], .is-selected, .tabs__item.is-active, .Pagination__Button--isActive")
+                if candidates.count() > 0:
+                    txt = (candidates.first.text_content() or "").strip()
+                    # find a number inside "Week 2" etc.
+                    m = re.search(r"\bWeek\s+(\d{1,2})\b", txt, flags=re.IGNORECASE)
+                    if m:
+                        detected_week = _int_or_none(m.group(1))
+            except Exception:
+                pass
+
+            # Determine season year robustly
+            now_local = datetime.now(ZoneInfo(TIMEZONE))
+            detected_year = _season_year_for_date(now_local)
+
+            # If we still did not detect week from DOM, compute week by football window (Mon..Mon) anchor = Thursday
+            if detected_week is None:
+                # anchor week number from ISO week of the Thursday in the current football week window
+                wk_mon = (now_local - timedelta(days=now_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+                thursday = wk_mon + timedelta(days=3)
+                # ESPN's “week” numbering isn’t ISO; but jumping to an explicit week URL is still safer than the active page.
+                # If this guess is off by 1, our prev/next snapshot below will still recover.
+                detected_week = thursday.isocalendar().week  # best-effort anchor
+
+            explicit_url = f"{base_url}/_/week/{detected_week}/year/{detected_year}"
+            print(f"DEBUG forcing explicit NFL URL: {explicit_url}")
+            page.goto(explicit_url, timeout=60000)
+            # Strong readiness: container + any row-like element
+            page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=30000)
+            # >>> INSERT: nudge virtualization to mount rows >>>
+            try:
+                page.mouse.wheel(0, 400)
+                page.wait_for_timeout(150)
+                page.mouse.wheel(0, -400)
+                page.wait_for_timeout(150)
+            except Exception:
+                pass
+            # <<< END INSERT <<<
+
+            # also ensure at least one row is mounted
+            page.wait_for_function(
+                """() => !!document.querySelector("tbody tr, tr.Table__TR, [role='row']")""",
+                timeout=10000
+            )
+            page.wait_for_timeout(300)
+        # <<< END INSERT <<<
+
         page.wait_for_selector("body", timeout=15000)
         page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=30000)
         page.wait_for_timeout(500)
+                # >>> INSERT: require at least one row-like element before we start collecting >>>
+        try:
+            page.wait_for_function(
+                """() => !!document.querySelector("tbody tr, tr.Table__TR, [role='row']")""",
+                timeout=8000
+            )
+        except Exception:
+            pass
+        # <<< END INSERT <<<
        
         snapshots = []
 
@@ -509,6 +597,46 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
 
         best_hits, best_name, best_rows = scored[0] if scored else (0, "current", cur)
         print(f"Chosen snapshot: {best_name} (hits={best_hits})")
+        # --- Fallback: brute-force weeks if we still have 0 hits --------------------
+        if best_hits == 0:
+            print("DEBUG fallback: probing explicit week URLs 1..23 for the current season…")
+            now_local = datetime.now(ZoneInfo(TIMEZONE))
+            season_year = _season_year_for_date(now_local)
+
+            def _collect_for_week(w):
+                try:
+                    explicit = f"{base_url}/_/week/{w}/year/{season_year}"
+                    print(f"DEBUG fallback probing: {explicit}")
+                    page.goto(explicit, timeout=60000)
+                    page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000)
+                    try:
+                        page.mouse.wheel(0, 400); page.wait_for_timeout(120)
+                        page.mouse.wheel(0, -400); page.wait_for_timeout(120)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(150)
+                    rows = _collect_from_page(page)
+                    hits = _rows_in_window(rows, week_start, week_end)
+                    print(f"DEBUG fallback week {w}: {hits} in-window out of {len(rows)} rows")
+                    return hits, rows, w
+                except Exception:
+                    return 0, [], w
+
+            probe_best_hits, probe_best_rows, probe_best_w = 0, [], None
+            for w in range(1, 24):  # NFL regular + early postseason ceiling
+                hits, rows, wnum = _collect_for_week(w)
+                if hits > probe_best_hits:
+                    probe_best_hits, probe_best_rows, probe_best_w = hits, rows, wnum
+                    if hits >= 8:  # good enough; stop early
+                        break
+
+            if probe_best_hits > 0:
+                print(f"DEBUG fallback chose week {probe_best_w} with {probe_best_hits} hits.")
+                best_hits, best_name, best_rows = probe_best_hits, f"week{probe_best_w}", probe_best_rows
+            else:
+                print("DEBUG fallback found no in-window games across weeks 1..23.")
+        # --- end fallback -----------------------------------------------------------
+
 
         browser.close()
         return best_rows
