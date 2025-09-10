@@ -1,11 +1,11 @@
 name: Run pick5 scraper
 
 on:
-  workflow_dispatch: {}   # manual trigger
+  workflow_dispatch: {}
   schedule:
-    # 21:00 UTC ≈ 5pm ET during Daylight Time
+    # 21:00 UTC ≈ 5pm ET (Daylight Time)
     - cron: "0 21 * * 2,4"
-    # 22:00 UTC ≈ 5pm ET during Standard Time
+    # 22:00 UTC ≈ 5pm ET (Standard Time)
     - cron: "0 22 * * 2,4"
 
 concurrency:
@@ -65,4 +65,3 @@ jobs:
           FORCE_WEEK_TABLE: "1"
           SKIP_PURGE: "0"
         run: python pick5_scraper.py
-
