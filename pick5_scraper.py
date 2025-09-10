@@ -7,7 +7,6 @@ COLLEGE_SHEET_ID = os.environ.get("COLLEGE_SHEET_ID")
 if not PICK_SHEET_ID or not COLLEGE_SHEET_ID:
   raise RuntimeError("Missing sheet IDs. Ensure PICK_SHEET_ID and COLLEGE_SHEET_ID are set in the environment.")
 
-os.system("cls" if os.name == "nt" else "clear")
 import re
 import time
 from datetime import datetime, timedelta
@@ -379,7 +378,19 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                 if not away_team or not home_team:
                     continue
 
-                game_time = _scan_time_from_row(row)  # <<< robust time scan
+                # Robust time scan + aria-label fallback; skip if still missing
+                game_time = _scan_time_from_row(row)
+                if not game_time:
+                    try:
+                        aria = row.get_attribute("aria-label") or ""
+                        m = TIME_RE.search(aria)
+                        if m:
+                            game_time = m.group(0).upper().replace("  ", " ")
+                    except Exception:
+                        pass
+                if not game_time:
+                    # no visible time -> don't include; prevents week-window false negatives
+                    continue
 
                 away_logo_url = _get_logo_url(away_cell)
                 home_logo_url = _get_logo_url(home_cell)
@@ -437,27 +448,38 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
     )
     week_end = week_start + timedelta(days=7)
 
+    print(f"DEBUG week window local: {week_start.strftime('%Y-%m-%d %H:%M')} → {week_end.strftime('%Y-%m-%d %H:%M')} ({TIMEZONE})")
+    print(f"DEBUG target URL: {url}")
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url, timeout=60000)
         page.wait_for_selector("body", timeout=15000)
-
+        page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=30000)
+        page.wait_for_timeout(500)
+       
         snapshots = []
 
         # current
         cur = _collect_from_page(page); snapshots.append(("current", cur, 0))
+        print(f"DEBUG pre-filter (current): {len(cur)} rows scraped")
+        print(f"DEBUG in-window (current): {_rows_in_window(cur, week_start, week_end)} rows")
 
         # prev
         try:
             prv = page.locator("button[aria-label='Previous Week'], a[aria-label='Previous Week']")
             if prv.count() > 0:
-                prv.first.click(); page.wait_for_selector("body", timeout=12000)
+                prv.first.click()
+                page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000); page.wait_for_timeout(300)
+
                 prev_rows = _collect_from_page(page); snapshots.append(("prev", prev_rows, -1))
                 # back to current
                 nxt = page.locator("button[aria-label='Next Week'], a[aria-label='Next Week']")
                 if nxt.count() > 0:
-                    nxt.first.click(); page.wait_for_selector("body", timeout=10000)
+                    nxt.first.click()
+                    page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000); page.wait_for_timeout(300)
+
         except Exception:
             pass
 
@@ -465,11 +487,14 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
         try:
             nxt = page.locator("button[aria-label='Next Week'], a[aria-label='Next Week']")
             if nxt.count() > 0:
-                nxt.first.click(); page.wait_for_selector("body", timeout=12000)
+                nxt.first.click()
+                page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000); page.wait_for_timeout(300)
+
                 next_rows = _collect_from_page(page); snapshots.append(("next", next_rows, +1))
                 # next-next
                 if nxt.count() > 0:
-                    nxt.first.click(); page.wait_for_selector("body", timeout=12000)
+                    nxt.first.click()
+                    page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000); page.wait_for_timeout(300)
                     nn_rows = _collect_from_page(page); snapshots.append(("next2", nn_rows, +2))
         except Exception:
             pass
@@ -655,10 +680,16 @@ def parse_kickoff_local(date_text: str, time_text: str, tzname: str) -> datetime
         if not m:
             return None
         month, day = m.group(1), int(m.group(2))
-        t = re.search(r"(\d{1,2}:\d{2}\s*[AP]M)", time_text, re.IGNORECASE)
+        # Normalize odd spacings like "A M" / "P  M", NBSPs, double spaces
+        tt = (time_text or "").replace("\u00a0", " ").upper()
+        tt = re.sub(r"\s+", " ", tt).strip()
+        tt = tt.replace("A M", "AM").replace("P M", "PM")
+
+        # Accept with or without a space before AM/PM
+        t = re.search(r"(\d{1,2}:\d{2})\s*(AM|PM)", tt, re.IGNORECASE)
         if not t:
             return None
-        timestr = t.group(1).upper().replace(" ", "")
+        timestr = f"{t.group(1)}{t.group(2)}"
         now = datetime.now(ZoneInfo(tzname))
         year = now.year
         month_num = datetime.strptime(month, "%B").month
@@ -733,11 +764,6 @@ def pack_pairs_to_games(row_pairs):
             "ou_bottom": home[5],        # F
         })
     return games
-
-def should_publish_now(now_dt: datetime, kickoff_dt: datetime | None) -> bool:
-    if kickoff_dt is None:
-        return True
-    return (kickoff_dt - now_dt) <= timedelta(days=PUBLISH_DAYS_AHEAD)
 
 def _ensure_grid_capacity(ws, needed_rows: int, needed_cols: int = 18):
     cur_rows, cur_cols = ws.row_count, ws.col_count
@@ -1161,6 +1187,7 @@ if __name__ == "__main__":
 
     if include_nfl:
         print("Running NFL scraper...")
+        print(f"Using NFL year/week: {NFL_YEAR}/{NFL_WEEK} (overridden={bool(os.environ.get('NFL_YEAR_OVERRIDE') or os.environ.get('NFL_WEEK_OVERRIDE'))})")
         nfl_rows = scrape_nfl_schedule(year=NFL_YEAR, week=NFL_WEEK)
 
     if include_college:
