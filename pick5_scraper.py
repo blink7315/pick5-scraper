@@ -1,57 +1,8 @@
-"""
-==========================================================
- Football Pool Scraper — NFL Week-Date Mapping (2025 Season)
-==========================================================
-
-This project uses a deterministic Tue→Mon mapping for NFL weeks.
-We DO NOT rely on ESPN’s shifting “active” week logic because we
-need lines earlier in the week for publishing.
-
-Rule of thumb for season year:
-  - Games in Sep–Dec → same calendar year.
-  - Games in Jan–Aug → previous calendar year.
-
-Regular Season 2025 (all Tue 00:00 local → next Tue 00:00 local):
-  Week 1:  Sep  2, 2025 – Sep  8, 2025
-  Week 2:  Sep  9, 2025 – Sep 15, 2025
-  Week 3:  Sep 16, 2025 – Sep 22, 2025
-  Week 4:  Sep 23, 2025 – Sep 29, 2025
-  Week 5:  Sep 30, 2025 – Oct  6, 2025
-  Week 6:  Oct  7, 2025 – Oct 13, 2025
-  Week 7:  Oct 14, 2025 – Oct 20, 2025
-  Week 8:  Oct 21, 2025 – Oct 27, 2025
-  Week 9:  Oct 28, 2025 – Nov  3, 2025
-  Week 10: Nov  4, 2025 – Nov 10, 2025
-  Week 11: Nov 11, 2025 – Nov 17, 2025
-  Week 12: Nov 18, 2025 – Nov 24, 2025
-  Week 13: Nov 25, 2025 – Dec  1, 2025
-  Week 14: Dec  2, 2025 – Dec  8, 2025
-  Week 15: Dec  9, 2025 – Dec 15, 2025
-  Week 16: Dec 16, 2025 – Dec 22, 2025
-  Week 17: Dec 23, 2025 – Dec 29, 2025
-  Week 18: Dec 30, 2025 – Jan  5, 2026
-
-Notes:
-- Playoffs are NOT mapped here. Handle them separately.
-- The mapping should be extended each new season.
-- If a kickoff date doesn’t fall inside any range,
-  scraper falls back to prev/next or brute-force probe.
-
-==========================================================
-"""
-
 import os
-
-# Read from GitHub Secrets (set in the workflow env)
-PICK_SHEET_ID = os.environ.get("PICK_SHEET_ID")
-COLLEGE_SHEET_ID = os.environ.get("COLLEGE_SHEET_ID")
-
-if not PICK_SHEET_ID or not COLLEGE_SHEET_ID:
-  raise RuntimeError("Missing sheet IDs. Ensure PICK_SHEET_ID and COLLEGE_SHEET_ID are set in the environment.")
-
+os.system("cls" if os.name == "nt" else "clear")
 import re
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from playwright.sync_api import sync_playwright
@@ -68,6 +19,8 @@ from gspread_formatting import (
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 SERVICE_ACCOUNT_FILE = "credentials.json"
 
+HEADLESS = os.environ.get("HEADLESS", "1") == "1"
+
 TIMEZONE = "America/Detroit"
 PHASE_CFB = "regular"     # regular | bowls
 PHASE_NFL = "regular"     # regular | playoffs
@@ -80,18 +33,8 @@ include_college = True
 TEST_MODE_IGNORE_LOCKS = False  # set to False in real runs
 
 # --- Optional week targeting (leave as None to use ESPN's active week) ---
-NFL_YEAR = None
-NFL_WEEK = None        # set None to use ESPN's current "active" week
-
-# --- Optional overrides via environment (for deterministic runs) ---
-NFL_WEEK_OVERRIDE = os.environ.get("NFL_WEEK_OVERRIDE")  # e.g., "37"
-NFL_YEAR_OVERRIDE = os.environ.get("NFL_YEAR_OVERRIDE")  # e.g., "2025"
-
-if NFL_WEEK_OVERRIDE:
-    NFL_WEEK = int(NFL_WEEK_OVERRIDE)
-if NFL_YEAR_OVERRIDE:
-    NFL_YEAR = int(NFL_YEAR_OVERRIDE)
-
+NFL_YEAR = 2025
+NFL_WEEK = 2        # set None to use ESPN's current "active" week
 CFB_YEAR = None
 CFB_WEEK = None        # set None to use ESPN's current "active" week
 
@@ -100,33 +43,13 @@ A1_RANGE_RE = re.compile(r"^(?:[^!]+!)?([A-Z]+)(\d+):([A-Z]+)(\d+)$")
 SPACER_ROWS_BETWEEN_LEAGUES = 4
 
 def week_tag_explicit(league: str, kickoff_dt: datetime | None):
-    """
-    Prefer explicit week inputs/overrides; otherwise:
-      - NFL: use our deterministic Tue→Mon mapping (Step 1)
-      - CFB: unchanged (only use explicit CFB_WEEK if provided)
-    """
-    # --- CFB: unchanged behavior ---
+    # Prefer explicit ESPN week if provided; fall back to dates only if not set.
     if league == "ncaaf" and CFB_WEEK is not None:
         yr = CFB_YEAR or (kickoff_dt.year if kickoff_dt else datetime.now(ZoneInfo(TIMEZONE)).year)
         return f"{yr}-CFB-Wk{CFB_WEEK}"
-
-    # --- NFL: honor explicit overrides first ---
     if league == "nfl" and NFL_WEEK is not None:
         yr = NFL_YEAR or (kickoff_dt.year if kickoff_dt else datetime.now(ZoneInfo(TIMEZONE)).year)
         return f"{yr}-NFL-Wk{NFL_WEEK}"
-
-    # NFL fallback: resolve from our Tue→Mon table (2025 season)
-    if league == "nfl":
-        # Use the kickoff date if available; otherwise fall back to *today* in local TZ
-        if kickoff_dt is not None:
-            local_d = kickoff_dt.astimezone(ZoneInfo(TIMEZONE)).date()
-        else:
-            local_d = datetime.now(ZoneInfo(TIMEZONE)).date()
-        season_year, wk = resolve_nfl_week_year_by_table(local_d)
-        if wk is not None:
-            return f"{season_year}-NFL-Wk{wk}"
-
-    # No explicit week tag; let compute_week_tag() handle it downstream
     return None
 
 def _a1_last_row(a1_range: str) -> int:
@@ -268,8 +191,7 @@ TEAM_LOGO_URLS = {
 }
 
 # === COLLEGE LOGO/ABBR (loaded from your Google Sheet) ===
-def build_college_logo_dict(sheet_id=None):
-    sheet_id = sheet_id or COLLEGE_SHEET_ID
+def build_college_logo_dict(sheet_id="1dh-IaArNHJ8UeqhZf93iPR4HpBgnr-8tmK1FhtpXj-4"):
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     client = gspread.authorize(creds)
     sheet = client.open_by_key(sheet_id).sheet1
@@ -283,8 +205,7 @@ def build_college_logo_dict(sheet_id=None):
                 logo_dict[team_name] = logo_url
     return logo_dict
 
-def build_college_abbreviation_dict(sheet_id=None):
-    sheet_id = sheet_id or COLLEGE_SHEET_ID
+def build_college_abbreviation_dict(sheet_id="1dh-IaArNHJ8UeqhZf93iPR4HpBgnr-8tmK1FhtpXj-4"):
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     client = gspread.authorize(creds)
     sheet = client.open_by_key(sheet_id).sheet1
@@ -331,234 +252,67 @@ def find_abbreviation(team_name, logo_url=""):
                 return abbr
     return None
 
-# >>> ADD THIS BLOCK (above scrape_nfl_schedule) >>>
-def _season_year_for_date(dt: datetime) -> int:
-    """
-    NFL season year: Sep–Dec -> same year; Jan–Aug -> previous year.
-    """
-    return dt.year if dt.month >= 9 else dt.year - 1
-
-def _int_or_none(s: str):
-    try:
-        return int(s)
-    except Exception:
-        return None
-
-# --- NFL 2025 Tue→Mon week windows (America/Detroit, inclusive) ---
-# NOTE: ESPN URL "year" stays the SEASON year (2025) even when the window ends in Jan 2026.
-NFL_WEEK_WINDOWS_2025 = [
-    (date(2025, 9,  2), date(2025, 9,  8),  1),
-    (date(2025, 9,  9), date(2025, 9, 15),  2),
-    (date(2025, 9, 16), date(2025, 9, 22),  3),
-    (date(2025, 9, 23), date(2025, 9, 29),  4),
-    (date(2025, 9, 30), date(2025, 10,  6), 5),
-    (date(2025, 10,  7), date(2025, 10, 13), 6),
-    (date(2025, 10, 14), date(2025, 10, 20), 7),
-    (date(2025, 10, 21), date(2025, 10, 27), 8),
-    (date(2025, 10, 28), date(2025, 11,  3), 9),
-    (date(2025, 11,  4), date(2025, 11, 10), 10),
-    (date(2025, 11, 11), date(2025, 11, 17), 11),
-    (date(2025, 11, 18), date(2025, 11, 24), 12),
-    (date(2025, 11, 25), date(2025, 12,  1), 13),
-    (date(2025, 12,  2), date(2025, 12,  8), 14),
-    (date(2025, 12,  9), date(2025, 12, 15), 15),
-    (date(2025, 12, 16), date(2025, 12, 22), 16),
-    (date(2025, 12, 23), date(2025, 12, 29), 17),
-    (date(2025, 12, 30), date(2026,  1,  5), 18),
-]
-
-def _nfl_week_from_local_date_2025(d: date) -> tuple[int | None, int | None]:
-    """
-    Return (season_year, week) for the given local date using the fixed Tue→Mon
-    windows for the 2025 NFL regular season. If no window matches, returns (None, None).
-    """
-    for start, end, wk in NFL_WEEK_WINDOWS_2025:
-        if start <= d <= end:
-            return 2025, wk
-    return None, None
-
-def resolve_nfl_week_year_by_table(today_local: date | None = None) -> tuple[int | None, int | None]:
-    """
-    Determine (NFL_YEAR, NFL_WEEK) deterministically from our local Tue→Mon table.
-    Currently implements 2025 season mapping only.
-    """
-    local_d = today_local or datetime.now(ZoneInfo(TIMEZONE)).date()
-    season_year, week = _nfl_week_from_local_date_2025(local_d)
-    return season_year, week
-
 # =========================
 # === SCRAPERS (8-col A..H output) ===
 # =========================
 def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
-    """
-    NFL scraper with robust time extraction:
-      - scans each row for a time token (no fixed column)
-      - navigates prev/next weeks up to 2 hops to land in the current football week (Mon..Mon)
-    """
     print("Launching browser and scraping NFL schedule...")
     base_url = "https://www.espn.com/nfl/schedule"
-    # >>> REPLACE THIS WHOLE url BLOCK >>>
-    # Resolve final (year, week) in this priority:
-    #  1) Function args (year/week) passed in
-    #  2) Deterministic Tue→Mon table (Step 1)
-    #  3) Fallback: leave week None and let DOM/fallback probes handle it
-    resolved_year = year
-    resolved_week = week
-
-    if resolved_week is None:
-        # Deterministic mapping for 2025 season
-        today_local = datetime.now(ZoneInfo(TIMEZONE)).date()
-        tab_year, tab_week = resolve_nfl_week_year_by_table(today_local)
-        if tab_week is not None:
-            resolved_year = tab_year
-            resolved_week = tab_week
-
-    if resolved_week is not None:
-        # Always hit the explicit ESPN week URL when we have a table/arg week
-        url = f"{base_url}/_/week/{resolved_week}/year/{resolved_year or _season_year_for_date(datetime.now(ZoneInfo(TIMEZONE)))}"
-        print(f"DEBUG resolved NFL via table/args -> YEAR/WEEK: {resolved_year}/{resolved_week}")
-        print(f"DEBUG target NFL URL: {url}")
+    if week is not None:
+        url = f"{base_url}/_/week/{week}" + (f"/year/{year}" if year is not None else "")
     else:
-        # No table match (e.g., out of season) → start at base and let existing logic probe
         url = base_url
-        print("DEBUG no table week match; starting at base and relying on DOM/probes.")
-    # <<< END REPLACE <<<
-    print(f"DEBUG using NFL_YEAR={resolved_year}, NFL_WEEK={resolved_week}")
-    print(f"DEBUG initial target URL (pre-nav): {url}")
 
+    all_data = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        page = browser.new_page()
+        page.goto(url, timeout=60000)
+        page.wait_for_selector("div.ScheduleTables", timeout=15000)
 
-    TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*[AP]M\b", re.IGNORECASE)
+        date_sections = page.locator("div.ScheduleTables > div")
+        print(f"✅ Found {date_sections.count()} game date sections\n")
 
-    def _section_locators(page):
-        for sel in ("div.ScheduleTables > div", "section.ScheduleTables > div", "div.ScheduleTables"):
-            loc = page.locator(sel)
-            if loc.count() > 0:
-                print(f"Using sections selector: {sel} (count={loc.count()})")
-                return sel, loc
-        print("No obvious section wrapper found; using all TBODYs.")
-        return None, page.locator("tbody")
+        for i in range(date_sections.count()):
+            section = date_sections.nth(i)
+            date_header = section.locator("div.Table__Title").text_content().strip()
+            rows = section.locator("tbody tr")
 
-    def _extract_rows_from_section(section):
-        rows = []
-        tbodys = section.locator("tbody")
-        if tbodys.count() == 0:
-            trs = section.locator("tr")
-            for j in range(trs.count()):
-                rows.append(trs.nth(j))
-            return rows
-        for tbi in range(tbodys.count()):
-            trs = tbodys.nth(tbi).locator("tr")
-            for j in range(trs.count()):
-                rows.append(trs.nth(j))
-        return rows
-
-    def _get_team_text(cell):
-        try:
-            links = cell.locator("a[href*='/team/']")
-            if links.count() == 0:
-                links = cell.locator("span.Table__Team a")
-            if links.count() > 0:
-                return links.nth(links.count() - 1).text_content(timeout=1500).strip()
-        except Exception:
-            pass
-        return (cell.text_content() or "").strip()
-
-    def _get_logo_url(cell):
-        try:
-            img = cell.locator("img")
-            if img.count() > 0:
-                return img.first.get_attribute("src") or ""
-        except Exception:
-            pass
-        return ""
-
-    def _scan_time_from_row(row_locator):
-        """Return first HH:MM AM/PM found anywhere in the row (string), else ''."""
-        try:
-            txt = (row_locator.text_content(timeout=800) or "").replace("\u00a0", " ")
-            m = TIME_RE.search(txt)
-            return m.group(0).upper().replace("  ", " ") if m else ""
-        except Exception:
-            return ""
-
-    def _parse_odds_from_row(row_locator):
-        line, ou = "N/A", "N/A"
-        try:
-            anchors = row_locator.locator("a")
-            for k in range(anchors.count()):
-                raw = (anchors.nth(k).text_content(timeout=600) or "").strip()
-                t = raw.lower().replace("\u00bd", ".5")
-                if t.startswith("line:") or t.startswith("spread:"):
-                    line = raw.split(":", 1)[-1].strip()
-                elif t.startswith("o/u:") or t.startswith("total:"):
-                    ou = raw.split(":", 1)[-1].strip()
-                elif re.match(r"^(?:o/u|total)\s*:?\s*(\d+(?:\.\d+)?)\b", t):
-                    m2 = re.match(r"^(?:o/u|total)\s*:?\s*(\d+(?:\.\d+)?)\b", t)
-                    ou = m2.group(1)
-                elif re.match(r"^[A-Za-z]{2,4}\s*[+-]\d+(\.\d+)?$", raw):
-                    line = raw.strip()
-        except Exception:
-            pass
-        return line, ou
-
-    def _collect_from_page(page):
-        rows_out = []
-        sections_sel, sections = _section_locators(page)
-        if sections.count() == 0:
-            return rows_out
-        num_sections = sections.count() if sections_sel != "div.ScheduleTables" else 1
-        print(f"DEBUG sections: {num_sections} via selector='{sections_sel or 'tbody'}'")
-        for i in range(num_sections):
-            section = sections.nth(i) if sections_sel != "div.ScheduleTables" else sections
-            try:
-                date_header = (section.locator(".Table__Title").first.text_content() or "").strip()
-            except Exception:
-                date_header = ""
-            for row in _extract_rows_from_section(section):
+            for j in range(rows.count()):
+                row = rows.nth(j)
                 tds = row.locator("td")
                 if tds.count() < 2:
                     continue
-                away_cell = tds.nth(0); home_cell = tds.nth(1)
-                away_team = _get_team_text(away_cell)
-                home_team = _get_team_text(home_cell)
-                if not away_team or not home_team:
-                    continue
-                # >>> INSERT: skip non-game rows (BYE/header echoes) >>>
-                at = away_team.strip().upper()
-                ht = home_team.strip().upper()
-                # ESPN sometimes renders BYE/headers in the first two cells
-                if at == "BYE" or ht == "BYE":
-                    continue
-                # Defensive: ignore rows where both cells echo the same header-like token
-                if at == ht:
-                    continue
-                # Common header tokens that can leak into cells
-                if at in ("MATCHUP", "GAME") or ht in ("MATCHUP", "GAME"):
-                    continue
-                # <<< END INSERT <<<
 
-                # Robust time scan + aria-label fallback; skip if still missing
-                game_time = _scan_time_from_row(row)
-                if not game_time:
-                    try:
-                        aria = row.get_attribute("aria-label") or ""
-                        m = TIME_RE.search(aria)
-                        if m:
-                            game_time = m.group(0).upper().replace("  ", " ")
-                    except Exception:
-                        pass
-                if not game_time:
-                    game_time = "N/A"
+                away_team_cell = tds.nth(0)
+                home_team_cell = tds.nth(1)
 
+                away_team = away_team_cell.locator("span.Table__Team a").nth(1).text_content(timeout=2000).strip()
+                home_team = home_team_cell.locator("span.Table__Team a").nth(1).text_content(timeout=2000).strip()
+                game_time = tds.nth(2).text_content(timeout=1000).strip() if tds.count() > 2 else "N/A"
 
-                away_logo_url = _get_logo_url(away_cell)
-                home_logo_url = _get_logo_url(home_cell)
+                away_logo_url = away_team_cell.locator("img").get_attribute("src") or ""
+                home_logo_url = home_team_cell.locator("img").get_attribute("src") or ""
+
                 away_logo_formula = get_logo_formula(away_team, away_logo_url, league="nfl")
                 home_logo_formula = get_logo_formula(home_team, home_logo_url, league="nfl")
 
-                line, ou = _parse_odds_from_row(row)
+                line, ou = "N/A", "N/A"
+                if tds.count() > 6:
+                    odds_links = tds.nth(6).locator("a")
+                    for k in range(odds_links.count()):
+                        raw = odds_links.nth(k).text_content(timeout=1000).strip()
+                        t = raw.lower().replace("\u00bd", ".5")  # handle ½
+                        # Accept multiple labels that ESPN uses
+                        if t.startswith("line:") or t.startswith("spread:"):
+                            line = raw.split(":", 1)[-1].strip()
+                        elif t.startswith("o/u:") or t.startswith("total:"):
+                            ou = raw.split(":", 1)[-1].strip()
+                        # Fallback: sometimes the anchor is just "ILL -45.5"
+                        elif re.match(r"^[A-Za-z]{2,4}\s*[+-]\d+(\.\d+)?$", raw):
+                            line = raw.strip()
 
-                def _abbr(team_name, logo_url):
+                def resolve_abbreviation_by_logo(team_name, logo_url):
                     u = (logo_url or "").lower()
                     if "nyg" in u: return "NYG"
                     if "nyj" in u: return "NYJ"
@@ -566,296 +320,35 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                     if "lac" in u: return "LAC"
                     return find_abbreviation(team_name)
 
-                away_abbr = _abbr(away_team, away_logo_url)
-                home_abbr = _abbr(home_team, home_logo_url)
+                away_abbr = resolve_abbreviation_by_logo(away_team, away_logo_url)
+                home_abbr = resolve_abbreviation_by_logo(home_team, home_logo_url)
 
                 away_line = home_line = "N/A"
-                if line != "N/A" and away_abbr and home_abbr:
+                if line != "N/A":
                     parts = line.split()
                     if len(parts) == 2:
                         favored_abbr, raw_spread = parts
                         try:
                             spread = float(raw_spread.replace("+", "").replace("-", ""))
-                            s = f"{spread:.1f}".rstrip('0').rstrip('.')
-                            if favored_abbr.upper() == away_abbr:
-                                away_line = f"{away_abbr} -{s}"; home_line = f"{home_abbr} +{s}"
-                            elif favored_abbr.upper() == home_abbr:
-                                home_line = f"{home_abbr} -{s}"; away_line = f"{away_abbr} +{s}"
+                            spread_str = f"{spread:.1f}".rstrip('0').rstrip('.')
+                            if favored_abbr == away_abbr:
+                                away_line = f"{away_abbr} -{spread_str}"
+                                home_line = f"{home_abbr} +{spread_str}"
+                            elif favored_abbr == home_abbr:
+                                home_line = f"{home_abbr} -{spread_str}"
+                                away_line = f"{away_abbr} +{spread_str}"
                         except ValueError:
                             pass
 
                 ou_top = f"O {ou}" if ou != "N/A" else "N/A"
                 ou_bottom = f"U {ou}" if ou != "N/A" else "N/A"
 
-                rows_out.append([away_logo_formula, away_team, "", away_line, "", ou_top, date_header, game_time])
-                rows_out.append([home_logo_formula, home_team, "", home_line, "", ou_bottom, date_header, game_time])
-
-        print(f"Collected NFL rows: {len(rows_out)}")
-        return rows_out
-
-    def _rows_in_window(rows, start, end):
-        hits = 0
-        for i in range(0, len(rows), 2):
-            dt = parse_kickoff_local(rows[i][6], rows[i][7], TIMEZONE)
-            if dt and (start <= dt < end):
-                hits += 1
-        return hits
-
-    tz = ZoneInfo(TIMEZONE)
-    week_start = (datetime.now(tz) - timedelta(days=datetime.now(tz).weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    week_end = week_start + timedelta(days=7)
-
-    print(f"DEBUG week window local: {week_start.strftime('%Y-%m-%d %H:%M')} → {week_end.strftime('%Y-%m-%d %H:%M')} ({TIMEZONE})")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, timeout=60000)
-        # >>> INSERT: force explicit week when none was provided >>>
-        if week is None:
-            # Try to read the selected week from the page (week picker/tab)
-            # Fall back to computing week/year deterministically.
-            try:
-                page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000)
-            except Exception:
-                pass
-
-            # Attempt DOM-based detection of week text like "Week 2"
-            detected_week = None
-            detected_year = None
-
-            try:
-                # common patterns: selected tab has aria-current or a selected class
-                candidates = page.locator("[aria-current='true'], .is-selected, .tabs__item.is-active, .Pagination__Button--isActive")
-                if candidates.count() > 0:
-                    txt = (candidates.first.text_content() or "").strip()
-                    # find a number inside "Week 2" etc.
-                    m = re.search(r"\bWeek\s+(\d{1,2})\b", txt, flags=re.IGNORECASE)
-                    if m:
-                        detected_week = _int_or_none(m.group(1))
-            except Exception:
-                pass
-
-            # Determine season year robustly
-            now_local = datetime.now(ZoneInfo(TIMEZONE))
-            detected_year = _season_year_for_date(now_local)
-
-            # If we still did not detect week from DOM, compute week by football window (Mon..Mon) anchor = Thursday
-            if detected_week is None:
-                # anchor week number from ISO week of the Thursday in the current football week window
-                wk_mon = (now_local - timedelta(days=now_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-                thursday = wk_mon + timedelta(days=3)
-                # ESPN's “week” numbering isn’t ISO; but jumping to an explicit week URL is still safer than the active page.
-                # If this guess is off by 1, our prev/next snapshot below will still recover.
-                detected_week = thursday.isocalendar().week  # best-effort anchor
-                # Clamp to NFL's sane range; if out of range, force brute-force later
-                if detected_week is not None and not (1 <= detected_week <= 23):
-                    detected_week = None
-
-            if detected_week is not None:
-                explicit_url = f"{base_url}/_/week/{detected_week}/year/{detected_year}"
-                print(f"DEBUG forcing explicit NFL URL: {explicit_url}")
-                page.goto(explicit_url, timeout=60000)
-                # Strong readiness: try the container, but don’t die if ESPN serves a blank variant
-                try:
-                    page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=12000)
-                except Exception:
-                    print("DEBUG: schedule container not visible on forced URL; will rely on brute-force probe.")
-            else:
-                print("DEBUG: no reliable week detected; skipping direct jump, will probe weeks 1..23.")
-
-            # >>> REPLACE: stronger virtualization nudge >>>
-            try:
-                for _ in range(2):
-                    page.mouse.wheel(0, 600); page.wait_for_timeout(220)
-                    page.mouse.wheel(0, -600); page.wait_for_timeout(220)
-                # tiny jitter to trip IntersectionObservers
-                page.mouse.wheel(0, 1); page.wait_for_timeout(60)
-            except Exception:
-                pass
-            # <<< END REPLACE <<<
-
-            # also ensure at least one row is mounted
-            page.wait_for_function(
-                """() => !!document.querySelector("tbody tr, tr.Table__TR, [role='row']")""",
-                timeout=10000
-            )
-            page.wait_for_timeout(500)
-        # <<< END INSERT <<<
-
-        page.wait_for_selector("body", timeout=15000)
-        page.wait_for_selector("body", timeout=15000)
-        try:
-            page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=12000)
-        except Exception:
-            print("DEBUG: container not visible; proceeding (fallback probe or row-scan may still succeed).")
-        page.wait_for_timeout(500)
-
-        page.wait_for_timeout(500)
-                # >>> INSERT: require at least one row-like element before we start collecting >>>
-        try:
-            page.wait_for_function(
-                """() => !!document.querySelector("tbody tr, tr.Table__TR, [role='row']")""",
-                timeout=8000
-            )
-        except Exception:
-            pass
-        # <<< END INSERT <<<
-       
-        print(f"DEBUG final page URL (pre-collect): {page.url}")
-
-        snapshots = []
-
-        # current
-        cur = _collect_from_page(page); snapshots.append(("current", cur, 0))
-        print(f"DEBUG pre-filter (current): {len(cur)} rows scraped")
-        print(f"DEBUG in-window (current): {_rows_in_window(cur, week_start, week_end)} rows")
-
-        # prev
-        try:
-            prv = page.locator("button[aria-label='Previous Week'], a[aria-label='Previous Week']")
-            if prv.count() > 0:
-                prv.first.click()
-                page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000); page.wait_for_timeout(300)
-
-                prev_rows = _collect_from_page(page); snapshots.append(("prev", prev_rows, -1))
-                # back to current
-                nxt = page.locator("button[aria-label='Next Week'], a[aria-label='Next Week']")
-                if nxt.count() > 0:
-                    nxt.first.click()
-                    page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000); page.wait_for_timeout(300)
-
-        except Exception:
-            pass
-
-        # next
-        try:
-            nxt = page.locator("button[aria-label='Next Week'], a[aria-label='Next Week']")
-            if nxt.count() > 0:
-                nxt.first.click()
-                page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000); page.wait_for_timeout(300)
-
-                next_rows = _collect_from_page(page); snapshots.append(("next", next_rows, +1))
-                # next-next
-                if nxt.count() > 0:
-                    nxt.first.click()
-                    page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000); page.wait_for_timeout(300)
-                    nn_rows = _collect_from_page(page); snapshots.append(("next2", nn_rows, +2))
-        except Exception:
-            pass
-
-        # choose the snapshot with the most games inside this Mon..Mon window
-        scored = []
-        for name, rows, offset in snapshots:
-            hits = _rows_in_window(rows, week_start, week_end)
-            print(f"Snapshot '{name}': {hits} in-window out of {len(rows)} rows")
-            scored.append((hits, name, rows))
-        scored.sort(reverse=True)
-
-        best_hits, best_name, best_rows = scored[0] if scored else (0, "current", cur)
-        print(f"Chosen snapshot: {best_name} (hits={best_hits})")
-
-        # >>> INSERT: zero in-window diagnostic dump (before fallback) >>>
-        if best_hits == 0:
-            try:
-                sel = "div.ScheduleTables, .ScheduleTables"
-                page.wait_for_selector(sel, state="visible", timeout=3000)
-                snippet = page.inner_text(sel, timeout=2000)
-            except Exception:
-                try:
-                    snippet = page.inner_text("body", timeout=2000)
-                except Exception:
-                    snippet = ""
-            snippet = (snippet or "").replace("\n", " ")[:300]
-            print(f"DEBUG 0 in-window; first 300 chars of table area: {snippet!r}")
-        # <<< END INSERT <<<
-
-        # --- Fallback: brute-force weeks if we still have 0 hits --------------------
-        if best_hits == 0:
-            # >>> INSERT: quick explicit ±1 week probe when we have a resolved week >>>
-            try:
-                if 'resolved_week' in locals() and resolved_week is not None:
-                    season_year_quick = (resolved_year
-                                        if 'resolved_year' in locals() and resolved_year is not None
-                                        else _season_year_for_date(datetime.now(ZoneInfo(TIMEZONE))))
-                    def _collect_for_explicit(w):
-                        if w < 1 or w > 23:
-                            return 0, [], w
-                        try:
-                            explicit = f"{base_url}/_/week/{w}/year/{season_year_quick}"
-                            print(f"DEBUG quick-probe: {explicit}")
-                            page.goto(explicit, timeout=60000)
-                            page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000)
-                            try:
-                                page.mouse.wheel(0, 600); page.wait_for_timeout(180)
-                                page.mouse.wheel(0, -600); page.wait_for_timeout(180)
-                            except Exception:
-                                pass
-                            rows = _collect_from_page(page)
-                            hits = _rows_in_window(rows, week_start, week_end)
-                            print(f"DEBUG quick-probe week {w}: {hits} in-window out of {len(rows)} rows")
-                            return hits, rows, w
-                        except Exception:
-                            return 0, [], w
-
-                    qhits_best, qrows_best, qw_best = 0, [], None
-                    for w in (resolved_week - 1, resolved_week + 1):
-                        h, r, wnum = _collect_for_explicit(w)
-                        if h > qhits_best:
-                            qhits_best, qrows_best, qw_best = h, r, wnum
-
-                    if qhits_best > 0:
-                        print(f"DEBUG quick-probe chose week {qw_best} with {qhits_best} hits.")
-                        browser.close()
-                        return qrows_best
-            except Exception:
-                pass
-            # <<< END INSERT <<<
-
-            print("DEBUG fallback: probing explicit week URLs 1..23 for the current season…")
-            now_local = datetime.now(ZoneInfo(TIMEZONE))
-            season_year = _season_year_for_date(now_local)
-
-            def _collect_for_week(w):
-                try:
-                    explicit = f"{base_url}/_/week/{w}/year/{season_year}"
-                    print(f"DEBUG fallback probing: {explicit}")
-                    page.goto(explicit, timeout=60000)
-                    page.wait_for_selector("div.ScheduleTables, .ScheduleTables", state="visible", timeout=15000)
-                    try:
-                        page.mouse.wheel(0, 400); page.wait_for_timeout(120)
-                        page.mouse.wheel(0, -400); page.wait_for_timeout(120)
-                    except Exception:
-                        pass
-                    page.wait_for_timeout(150)
-                    rows = _collect_from_page(page)
-                    hits = _rows_in_window(rows, week_start, week_end)
-                    print(f"DEBUG fallback week {w}: {hits} in-window out of {len(rows)} rows")
-                    return hits, rows, w
-                except Exception:
-                    return 0, [], w
-
-            probe_best_hits, probe_best_rows, probe_best_w = 0, [], None
-            for w in range(1, 24):  # NFL regular + early postseason ceiling
-                hits, rows, wnum = _collect_for_week(w)
-                if hits > probe_best_hits:
-                    probe_best_hits, probe_best_rows, probe_best_w = hits, rows, wnum
-                    if hits >= 8:  # good enough; stop early
-                        break
-
-            if probe_best_hits > 0:
-                print(f"DEBUG fallback chose week {probe_best_w} with {probe_best_hits} hits.")
-                best_hits, best_name, best_rows = probe_best_hits, f"week{probe_best_w}", probe_best_rows
-            else:
-                print("DEBUG fallback found no in-window games across weeks 1..23.")
-        # --- end fallback -----------------------------------------------------------
-
+                # A..H: Logo, Team, Pick#, Line, Pick#, O/U, Date, Time
+                all_data.append([away_logo_formula, away_team, "", away_line, "", ou_top, date_header, game_time])
+                all_data.append([home_logo_formula, home_team, "", home_line, "", ou_bottom, date_header, game_time])
 
         browser.close()
-        print(f"✅ NFL scrape complete — collected {len(best_rows)//2} games ({len(best_rows)} rows).")
-        return best_rows
+        return all_data
 
 def _normalize_name(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s&'-]", "", s)).strip().lower()
@@ -894,7 +387,7 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
 
     all_data = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=HEADLESS)
         context = browser.new_context()
         page = context.new_page()
         page.goto(url, timeout=60000)
@@ -902,10 +395,6 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
 
         date_sections = page.locator("div.ScheduleTables--ncaaf")
         print(f"✅ Found {date_sections.count()} game date sections\n")
-        if not COLLEGE_INCLUDE_ALL:
-            print("Top-25 filter active (only games with at least one ranked team).")
-
-
 
         for i in range(date_sections.count()):
             section = date_sections.nth(i)
@@ -917,12 +406,7 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
                 continue
 
             rows = section.locator("tr.Table__TR")
-            count_rows = rows.count()
-            print(f"  - Found {count_rows} rows total")
-            if count_rows == 0:
-                print("  - Skipping empty section (duplicate header / no rows).")
-                continue
-            kept_this_section = 0
+            print(f"  - Found {rows.count()} rows total")
 
             for j in range(rows.count()):
                 row = rows.nth(j)
@@ -945,8 +429,6 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
 
                     if not COLLEGE_INCLUDE_ALL and (away_rank is None and home_rank is None):
                         continue
-                    # Count games that survive the Top-25 filter (once per matchup)
-                    kept_this_section += 1
 
                     line, ou = "N/A", "N/A"
                     if tds.count() > 6:
@@ -1003,11 +485,8 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
 
                 except Exception:
                     continue
-            if not COLLEGE_INCLUDE_ALL:
-                print(f"  - Kept {kept_this_section} games after Top-25 filter")
 
         browser.close()
-        print(f"✅ College scrape complete — collected {len(all_data)//2} games ({len(all_data)} rows).")
         return all_data
 
 # =========================
@@ -1037,36 +516,17 @@ def parse_kickoff_local(date_text: str, time_text: str, tzname: str) -> datetime
         m = re.search(r"([A-Za-z]+)\s+(\d{1,2})", date_text)
         if not m:
             return None
-        month, day = m.group(1).strip(), int(m.group(2))
-        # Normalize common month abbreviations (with/without trailing period)
-        mon_token = month.rstrip(".")
-        MONTH_ALIASES = {
-            "Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April", "May": "May",
-            "Jun": "June", "Jul": "July", "Aug": "August", "Sep": "September", "Sept": "September",
-            "Oct": "October", "Nov": "November", "Dec": "December",
-        }
-        full_month = MONTH_ALIASES.get(mon_token, month)
-
-        # Normalize odd spacings like "A M" / "P  M", NBSPs, double spaces
-        tt = (time_text or "").replace("\u00a0", " ").upper()
-        tt = re.sub(r"\s+", " ", tt).strip()
-        tt = tt.replace("A M", "AM").replace("P M", "PM")
-
-        # Accept with or without a space before AM/PM
-        t = re.search(r"(\d{1,2}:\d{2})\s*(AM|PM)", tt, re.IGNORECASE)
+        month, day = m.group(1), int(m.group(2))
+        t = re.search(r"(\d{1,2}:\d{2}\s*[AP]M)", time_text, re.IGNORECASE)
         if not t:
             return None
-        timestr = f"{t.group(1)}{t.group(2)}"
+        timestr = t.group(1).upper().replace(" ", "")
         now = datetime.now(ZoneInfo(tzname))
         year = now.year
-        try:
-            month_num = datetime.strptime(full_month, "%B").month
-        except ValueError:
-            # Fallback: parse abbreviated month (e.g., "Sep")
-            month_num = datetime.strptime(mon_token, "%b").month
+        month_num = datetime.strptime(month, "%B").month
         if now.month >= 11 and month_num <= 2:
             year = now.year + 1
-        dt = datetime.strptime(f"{full_month} {day} {year} {timestr}", "%B %d %Y %I:%M%p").replace(tzinfo=ZoneInfo(tzname))
+        dt = datetime.strptime(f"{month} {day} {year} {timestr}", "%B %d %Y %I:%M%p").replace(tzinfo=ZoneInfo(tzname))
         if (now - dt).days > 180:
             dt = dt.replace(year=dt.year + 1)
         return dt
@@ -1136,6 +596,11 @@ def pack_pairs_to_games(row_pairs):
         })
     return games
 
+def should_publish_now(now_dt: datetime, kickoff_dt: datetime | None) -> bool:
+    if kickoff_dt is None:
+        return True
+    return (kickoff_dt - now_dt) <= timedelta(days=PUBLISH_DAYS_AHEAD)
+
 def _ensure_grid_capacity(ws, needed_rows: int, needed_cols: int = 18):
     cur_rows, cur_cols = ws.row_count, ws.col_count
     target_rows = max(cur_rows, int(needed_rows))
@@ -1190,81 +655,90 @@ def _cleanup_legacy_misaligned_rows(lines_ws):
         deleted += (e - s + 1)
     return deleted
 
-def _football_week_monday(dt: datetime) -> datetime:
-    """Return Monday 00:00 of dt's week in TIMEZONE (local)."""
-    dt = dt.astimezone(ZoneInfo(TIMEZONE))
-    wkmon = (dt - timedelta(days=dt.weekday()))
-    return wkmon.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=ZoneInfo(TIMEZONE))
-
 def _purge_lines_to_current_week(spreadsheet, now_dt: datetime, phase_cfb: str, phase_nfl: str):
     """
-    NEW POLICY:
-      - Define the current football week as Monday 00:00 local -> next Monday 00:00 (exclusive).
-      - KEEP any pair whose KickoffLocal (col M) falls within this window.
-      - DELETE everything else (even if Locked = Y).
-      - Blank/invalid KickoffLocal => delete.
+    Keep only the current football week's rows in Lines for each league.
+    Deletes any game pair whose WeekTag != the current WeekTag for its league.
+
+    SAFETY: If the deletion set would remove all non-frozen rows (row 1 is frozen),
+    pre-grow the grid so at least one pair remains after deletion. This avoids:
+    "Invalid requests[0].deleteDimension: Sorry, it is not possible to delete all non-frozen rows."
     """
     try:
         lines_ws = spreadsheet.worksheet("Lines")
     except gspread.exceptions.WorksheetNotFound:
-        return
+        return  # nothing to purge
 
     vals = lines_ws.get_all_values()
     if not vals or len(vals) < 2:
         return
 
-    COL_KICK = 12  # M "YYYY-MM-DD HH:MM" local
+    # Compute current WeekTags based on *now_dt*
+    cfb_tag = week_tag_explicit("ncaaf", now_dt) or compute_week_tag(now_dt, league="ncaaf", phase=phase_cfb)
+    nfl_tag = week_tag_explicit("nfl",   now_dt) or compute_week_tag(now_dt, league="nfl",   phase=phase_nfl)
 
-    week_start = _football_week_monday(now_dt)
-    week_end = week_start + timedelta(days=7)  # exclusive
 
-    def parse_kick(s: str) -> datetime | None:
-        s = (s or "").strip()
-        if not s:
-            return None
-        try:
-            return datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo(TIMEZONE))
-        except Exception:
-            return None
+    keep_for_league = {
+        "ncaaf": cfb_tag,
+        "nfl":   nfl_tag,
+    }
 
+    # Identify top rows of pairs to delete
     to_delete_tops = []
-    for top in range(2, len(vals) + 1, 2):  # pair tops
-        row_top = vals[top - 1]
-        if len(row_top) < COL_KICK:
-            to_delete_tops.append(top)
+    for top in range(2, len(vals) + 1, 2):  # 2,4,6,... (pairs)
+        row = vals[top - 1]
+        if len(row) < 12:
             continue
-        k = parse_kick(row_top[COL_KICK - 1])
-        if not k or not (week_start <= k < week_end):
-            to_delete_tops.append(top)
+        league = (row[8] or "").strip().lower()     # I
+        weektag = (row[9] or "").strip()            # J
+        gamekey = (row[11] or "").strip()           # L
+        if not gamekey:
+            continue  # skip blanks
 
-    # >>> INSERT: purge accounting >>>
-    total_pairs = max((len(vals) - 1) // 2, 0)
-    deleted_pairs = len(to_delete_tops)
-    kept_pairs = max(total_pairs - deleted_pairs, 0)
-    # <<< END INSERT <<<
+        if league in keep_for_league and weektag != keep_for_league[league]:
+            to_delete_tops.append(top)
 
     if not to_delete_tops:
-        print(f"Purge: nothing to delete — kept {kept_pairs}/{total_pairs} pairs for current week "
-              f"{week_start.strftime('%Y-%m-%d')}→{week_end.strftime('%Y-%m-%d')}.")
+        print("Purge: nothing to delete.")
         return
 
-    # group contiguous 2-row blocks and delete bottom-up
-    blocks, start, prev = [], None, None
+    # Group contiguous blocks of pairs (delete fewer, larger ranges)
+    blocks = []
+    start = None
+    prev = None
     for t in to_delete_tops:
         if start is None:
-            start = prev = t
+            start = t
+            prev = t
         elif t == prev + 2:
             prev = t
         else:
-            blocks.append((start, prev + 1))
-            start = prev = t
+            blocks.append((start, prev + 1))  # include second row of the last pair
+            start = t
+            prev = t
     blocks.append((start, prev + 1))
 
+    # ---- SAFETY: don't delete all non-frozen rows ----
+    frozen_rows = 1  # we freeze header row 1
+    cur_rows = lines_ws.row_count
+    rows_to_delete = sum((e - s + 1) for s, e in blocks)
+    remaining_after = cur_rows - frozen_rows - rows_to_delete  # how many non-frozen rows remain?
+
+    if remaining_after <= 1:
+        # Leave at least one EMPTY PAIR after purge.
+        need_pairs_left = 2  # rows
+        additional_needed = need_pairs_left - remaining_after
+        if additional_needed < 2:
+            additional_needed = 2  # grow by at least one pair
+        new_total_rows = cur_rows + additional_needed
+        print(f"⚠️ Purge would delete all non-frozen rows. Pre-growing grid {cur_rows}→{new_total_rows}")
+        lines_ws.resize(rows=new_total_rows, cols=lines_ws.col_count)
+
+    # Delete bottom-up so indices don't shift
     for s, e in reversed(blocks):
         lines_ws.delete_rows(s, e)
 
-    print(f"Purge: deleted {deleted_pairs} pair(s); kept {kept_pairs}/{total_pairs} for current week "
-        f"{week_start.strftime('%Y-%m-%d')}→{week_end.strftime('%Y-%m-%d')}.")
+    print("Purge: completed without deleting all non-frozen rows.")
 
 def queue_pair_range(ws_title: str, top_row: int, full_away: list, full_home: list):
     """
@@ -1332,17 +806,15 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
     """
     staging_rows: flat list of rows (away, home, away, home, ...)
     Merge into 'Lines' by GameKey with placeholders, release/freeze windows, and locks.
-    Now:
-      - Purge keeps only current football week (Mon..Mon).
-      - When appending CFB after any existing data, insert 4 blank rows.
     """
     tz = ZoneInfo(TIMEZONE)
+    # TEST MODE "now" (matches your prior constant)
     now = datetime.now(tz)
 
-    # Normalize to A..H
+    # Normalize rows to A..H (Logo, Team, Pick#, Line, Pick#, O/U, Date, Time)
     staging_rows = normalize_rows_to_AH(staging_rows)
 
-    # Ensure ws + headers
+    # Ensure Lines exists + headers
     try:
         lines_ws = spreadsheet.worksheet("Lines")
     except gspread.exceptions.WorksheetNotFound:
@@ -1355,25 +827,36 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
     if deleted:
         print(f"🧹 Removed {deleted} legacy misaligned rows from Lines.")
 
-    # Purge to current football week only (deletes even Locked=Y if out-of-week)
-    _purge_lines_to_current_week(
-        spreadsheet,
-        now_dt=now,
-        phase_cfb=phase if league == "ncaaf" else PHASE_CFB,
-        phase_nfl=phase if league == "nfl"   else PHASE_NFL
-    )
+    # Purge old weeks so Lines only contains the current week per league
+    if os.environ.get("SKIP_PURGE", "1") != "1":
+        _purge_lines_to_current_week(
+            spreadsheet,
+            now_dt=now,
+            phase_cfb=phase if league == "ncaaf" else PHASE_CFB,
+            phase_nfl=phase if league == "nfl"   else PHASE_NFL
+        )
+    else:
+        print("Purge: SKIPPED (SKIP_PURGE=1)")
 
-    # Refresh + read existing
+
+    # 🔄 IMPORTANT: refresh handle; row_count/col_count can be stale after deletes
     lines_ws = spreadsheet.worksheet("Lines")
+
+    # Rebuild 'existing' AFTER purge
     existing = lines_ws.get_all_values()
 
-    # --- Spacer: if appending CFB and there is any existing data, add 4 rows ---
+    # Insert a spacer before the very first CFB block if NFL already exists
     spacer_rows = 0
-    if league == "ncaaf" and len(existing) > 1:
-        spacer_rows = SPACER_ROWS_BETWEEN_LEAGUES
+    if league == "ncaaf":
+        # existing includes header at index 0
+        leagues = [(row[8] or "").strip().lower() for row in existing[1:] if len(row) >= 9]
+        has_nfl = any(l == "nfl" for l in leagues)
+        has_cfb = any(l == "ncaaf" for l in leagues)
+        if has_nfl and not has_cfb:
+            spacer_rows = SPACER_ROWS_BETWEEN_LEAGUES if "SPACER_ROWS_BETWEEN_LEAGUES" in globals() else 4
 
-    # Index existing games by GameKey (L)
-    gamekey_col = 12
+    # Build index of existing games by GameKey (top row only)
+    gamekey_col = 12  # L
     index = {}
     for r in range(2, len(existing)+1, 2):
         row_vals = existing[r-1]
@@ -1383,31 +866,27 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
                 index[gk] = r
 
     games = pack_pairs_to_games(staging_rows)
-    seen_in_batch = set()
 
     def fmt(dt):
         return dt.astimezone(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M") if dt else ""
 
+    # Compute the next append TOP row, applying spacer and keeping it even
     last_row_with_data = len(existing) if existing else 1
     append_top = last_row_with_data + 1 + spacer_rows
     if append_top < 2:
         append_top = 2
     if append_top % 2 == 1:
-        append_top += 1
+        append_top += 1  # bump to even
 
-    queued_ranges, touched_new, touched_upd = [], [], []
+    queued_ranges = []
+    touched_new = []   # for formatting
+    touched_upd = []   # for formatting
 
     for g in games:
         kickoff_dt = parse_kickoff_local(g["date_text"], g["time_text"], TIMEZONE)
         release_at, freeze_at = compute_release_freeze(kickoff_dt, league, phase)
         week_tag = week_tag_explicit(league, kickoff_dt) or compute_week_tag(kickoff_dt, league, phase)
         game_key = make_game_key(kickoff_dt, g["away_team_disp"], g["home_team_disp"], espn_game_id=None)
-        # >>> INSERT: skip duplicate GameKey within this batch >>>
-        if game_key in seen_in_batch:
-            print(f"DEBUG duplicate game in batch (skipped): {game_key}")
-            continue
-        seen_in_batch.add(game_key)
-        # <<< END INSERT <<<
 
         locked_flag = "N"
         status = "placeholder"
@@ -1415,34 +894,44 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
 
         window_ok = publish_window_allows(now, kickoff_dt)
 
-        # Window+time gates
+        # Only publish if we're in-window AND past the release time
         if window_ok and release_at and now >= release_at:
-            status = "posted"; allow_lines = True
-        if window_ok and freeze_at and now >= freeze_at:
-            locked_flag = "Y"; status = "locked"; allow_lines = True
+            status = "posted"
+            allow_lines = True
 
-        a = g["away_row"][:]
+        # Only lock (and still allow lines to show) if we're in-window AND past freeze time
+        if window_ok and freeze_at and now >= freeze_at:
+            locked_flag = "Y"
+            status = "locked"
+            allow_lines = True
+
+        a = g["away_row"][:]  # A..H
         h = g["home_row"][:]
 
-        # Strip lines/O-U for brand new rows if not allowed yet
-        if not allow_lines and game_key not in index:
-            a[3] = ""; h[3] = ""; a[5] = ""; h[5] = ""
+        if not allow_lines:
+            # Only strip for brand-new games; never touch existing rows
+            if game_key not in index:
+                a[3] = ""  # D Line
+                h[3] = ""
+                a[5] = ""  # F O/U
+                h[5] = ""
         else:
+            # Normalize "N/A" to blank when we ARE allowed to publish
             for row in (a, h):
                 if row[3] == "N/A": row[3] = ""
                 if row[5] == "N/A": row[5] = ""
 
         meta = [
-            ("ncaaf" if league == "ncaaf" else "nfl"),   # I
-            week_tag,                                    # J
-            phase,                                       # K
-            game_key,                                    # L
-            fmt(kickoff_dt),                             # M
-            fmt(release_at),                             # N
-            fmt(freeze_at),                              # O
-            locked_flag,                                 # P
-            status,                                      # Q
-            fmt(now),                                    # R
+            ("ncaaf" if league == "ncaaf" else "nfl"),   # I League
+            week_tag,                                    # J WeekTag
+            phase,                                       # K Phase
+            game_key,                                    # L GameKey
+            fmt(kickoff_dt),                             # M KickoffLocal
+            fmt(release_at),                             # N ReleaseAt
+            fmt(freeze_at),                              # O FreezeAt
+            locked_flag,                                 # P Locked
+            status,                                      # Q Status
+            fmt(now),                                    # R LastUpdated
         ]
 
         full_away = a + meta
@@ -1450,43 +939,57 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
 
         if game_key not in index:
             rng = queue_pair_range(lines_ws.title, append_top, full_away, full_home)
-            queued_ranges.append(rng); touched_new.append(rng["range"])
+            queued_ranges.append(rng)
+            touched_new.append(rng["range"])
             index[game_key] = append_top
-            append_top += 2
+            append_top += 2  # advance to next pair
         else:
             top_row = index[game_key]
-            locked_cell = None
             try:
-                locked_cell = lines_ws.get_value(f"P{top_row}")
+                locked_cell = lines_ws.get_value(f"P{top_row}")  # existing lock state
             except Exception:
-                pass
+                locked_cell = None
+
+            # Respect locked rows in real runs
             if (not TEST_MODE_IGNORE_LOCKS) and locked_cell and str(locked_cell).upper() == "Y":
                 continue
+
+            # Out of publish window? Leave ENTIRE existing pair untouched.
             if not allow_lines:
                 continue
-            upd = queue_pair_range(lines_ws.title, top_row, full_away, full_home)
-            queued_ranges.append(upd); touched_upd.append(upd["range"])
 
-    # Strict, ordered write
+            upd = queue_pair_range(lines_ws.title, top_row, full_away, full_home)
+            queued_ranges.append(upd)
+            touched_upd.append(upd["range"])
+
+    # === Strict, ordered write ===
     written_ranges, max_row_needed = upsert_lines_strict(lines_ws, queued_ranges)
 
-    # Formatting for touched ranges
+    # === Formatting on the rows we just touched ===
     if written_ranges:
+        # ensure capacity (harmless if already big enough)
         _ensure_grid_capacity(lines_ws, needed_rows=max_row_needed, needed_cols=18)
+
         with batch_updater(lines_ws.spreadsheet) as batch:
             right_border_thick = Border("SOLID_THICK")
             light_orange = Color(1.0, 0.898, 0.8)
             light_blue = Color(0.8, 0.898, 1.0)
+
             for rng in written_ranges:
                 m = re.match(r".*A(\d+):R(\d+)", rng)
-                if not m: continue
-                r1, r2 = int(m.group(1)), int(m.group(2))
+                if not m:
+                    continue
+                r1 = int(m.group(1))
+                r2 = int(m.group(2))
+                # Perimeter across A..H
                 batch.format_cell_range(lines_ws, f"A{r1}:H{r1}", CellFormat(borders=Borders(top=Border("SOLID"))))
                 batch.format_cell_range(lines_ws, f"A{r2}:H{r2}", CellFormat(borders=Borders(bottom=Border("SOLID"))))
                 batch.format_cell_range(lines_ws, f"A{r1}:A{r2}", CellFormat(borders=Borders(left=Border("SOLID"))))
                 batch.format_cell_range(lines_ws, f"H{r1}:H{r2}", CellFormat(borders=Borders(right=Border("SOLID"))))
+                # Header-like fills for C–F
                 batch.format_cell_range(lines_ws, f"C{r1}:D{r2}", CellFormat(backgroundColor=light_orange))
                 batch.format_cell_range(lines_ws, f"E{r1}:F{r2}", CellFormat(backgroundColor=light_blue))
+                # Thick vertical borders at B, D, F
                 batch.format_cell_range(lines_ws, f"B{r1}:B{r2}", CellFormat(borders=Borders(right=right_border_thick)))
                 batch.format_cell_range(lines_ws, f"D{r1}:D{r2}", CellFormat(borders=Borders(right=right_border_thick)))
                 batch.format_cell_range(lines_ws, f"F{r1}:F{r2}", CellFormat(borders=Borders(right=right_border_thick)))
@@ -1501,7 +1004,9 @@ def upload_via_staging_and_merge(data_rows, league: str, phase: str):
 
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     client = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(PICK_SHEET_ID)
+    sheet_id = os.environ["PICK_SHEET_ID"]
+    spreadsheet = client.open_by_key(sheet_id)
+
 
     temp_sheet_name = "temp_Lines"
     try:
@@ -1573,23 +1078,6 @@ if __name__ == "__main__":
 
     if include_nfl:
         print("Running NFL scraper...")
-        print(f"Using NFL year/week: {NFL_YEAR}/{NFL_WEEK} (overridden={bool(os.environ.get('NFL_YEAR_OVERRIDE') or os.environ.get('NFL_WEEK_OVERRIDE'))})")
-
-        # >>> INSERT: NFL week-tag source preview >>>
-        try:
-            now_local = datetime.now(ZoneInfo(TIMEZONE))
-            if NFL_WEEK is not None or NFL_YEAR is not None:
-                src = "override/args"
-                prev_year = NFL_YEAR or _season_year_for_date(now_local)
-                prev_week = NFL_WEEK
-            else:
-                prev_year, prev_week = resolve_nfl_week_year_by_table(now_local.date())
-                src = "table" if prev_week is not None else "fallback"
-            print(f"DEBUG NFL week-tag source: {src}; season={prev_year}, week={prev_week}")
-        except Exception as e:
-            print(f"DEBUG NFL week-tag preview failed: {e}")
-        # <<< END INSERT <<<
-
         nfl_rows = scrape_nfl_schedule(year=NFL_YEAR, week=NFL_WEEK)
 
     if include_college:
