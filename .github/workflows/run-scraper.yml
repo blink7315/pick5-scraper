@@ -1,9 +1,14 @@
 name: Run pick5 scraper
 
 on:
-  # manual only while testing
   workflow_dispatch: {}
-  # when ready, we’ll add the DST-safe 5pm schedule
+  schedule:
+    - cron: "0 21 * * 2,4"  # Tue/Thu 5pm EDT
+    - cron: "0 22 * * 2,4"  # Tue/Thu 5pm EST
+
+concurrency:
+  group: pick5-scraper
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -31,13 +36,19 @@ jobs:
           ${{ secrets.GOOGLE_SA_JSON }}
           JSON
 
+      # Double-check local time, so both crons only run at 5pm Detroit
+      - name: Gate to 5pm America/Detroit
+        run: |
+          DET_HOUR=$(TZ=America/Detroit date +%H)
+          if [ "$DET_HOUR" != "17" ]; then
+            echo "Not 5pm Detroit (hour=$DET_HOUR). Exiting without running."
+            exit 0
+          fi
+
       - name: Run scraper
         env:
           PICK_SHEET_ID: ${{ secrets.PICK_SHEET_ID }}
-          COLLEGE_SHEET_ID: ${{ secrets.COLLEGE_SHEET_ID }}   # <-- fixed
+          COLLEGE_SHEET_ID: ${{ secrets.COLLEGE_SHEET_ID }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           PYTHONUNBUFFERED: "1"
-          # temporary deterministic NFL override (optional)
-          NFL_WEEK_OVERRIDE: "37"
-          NFL_YEAR_OVERRIDE: "2025"
         run: python pick5_scraper.py
