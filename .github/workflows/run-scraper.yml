@@ -40,6 +40,7 @@ jobs:
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           PYTHONUNBUFFERED: "1"
           HEADLESS: "1"            # ← add this line
+          SKIP_PURGE: "1"      # ← add this line
         run: python pick5_scraper.py
 
 
