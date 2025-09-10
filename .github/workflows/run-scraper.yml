@@ -3,10 +3,8 @@ name: Run pick5 scraper
 on:
   workflow_dispatch: {}
   schedule:
-    # 21:00 UTC ≈ 5pm ET (Daylight Time)
-    - cron: "0 21 * * 2,4"
-    # 22:00 UTC ≈ 5pm ET (Standard Time)
-    - cron: "0 22 * * 2,4"
+    - cron: "0 21 * * 2,4"  # 5pm ET during DST (21:00 UTC)
+    - cron: "0 22 * * 2,4"  # 5pm ET during Standard Time (22:00 UTC)
 
 concurrency:
   group: pick5-scraper
@@ -25,13 +23,11 @@ jobs:
         id: timeguard
         run: |
           DET_HOUR=$(TZ=America/Detroit date +%H)
-          DET_DOW=$(TZ=America/Detroit date +%u)   # 1=Mon ... 7=Sun
+          DET_DOW=$(TZ=America/Detroit date +%u)
           if [ "$DET_HOUR" = "17" ] && { [ "$DET_DOW" = "2" ] || [ "$DET_DOW" = "4" ]; }; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
-            echo "Proceeding: Tue/Thu 5pm Detroit."
           else
             echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping: not Tue/Thu 5pm Detroit (hour=$DET_HOUR, dow=$DET_DOW)."
           fi
 
       - name: Set up Python
