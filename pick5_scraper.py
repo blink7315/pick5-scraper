@@ -312,6 +312,7 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
         all_rows = []
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=HEADLESS)
+            context = browser.new_context(timezone_id=TIMEZONE, locale="en-US")
             page = browser.new_page()
             page.goto(url, timeout=60000)
             page.wait_for_selector("div.ScheduleTables", timeout=15000)
@@ -505,7 +506,7 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
     all_data = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
-        context = browser.new_context()
+        context = browser.new_context(timezone_id=TIMEZONE, locale="en-US")
         page = context.new_page()
         page.goto(url, timeout=60000)
         page.wait_for_selector("div.ScheduleTables--ncaaf")
