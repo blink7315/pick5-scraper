@@ -649,16 +649,22 @@ def parse_kickoff_local(date_text: str, time_text: str, tzname: str) -> datetime
 def compute_release_freeze(kickoff_dt: datetime | None, league: str, phase: str):
     if kickoff_dt is None:
         return None, None
-    tz = kickoff_dt.tzinfo
-    dow = kickoff_dt.weekday()  # Mon=0..Sun=6
-    monday = (kickoff_dt - timedelta(days=dow)).replace(hour=0, minute=0, second=0, microsecond=0)
-    if dow in (3, 4):  # Thu/Fri
-        rel = (monday + timedelta(days=1)).replace(hour=0, minute=1)   # Tue 00:01
-        frz = (monday + timedelta(days=1)).replace(hour=12, minute=0)  # Tue 12:00
-    else:  # Sat/Sun/Mon and others -> Thu window
-        rel = (monday + timedelta(days=3)).replace(hour=0, minute=1)   # Thu 00:01
-        frz = (monday + timedelta(days=3)).replace(hour=12, minute=0)  # Thu 12:00
-    return rel.astimezone(tz), frz.astimezone(tz)
+    # Mon=0..Sun=6
+    dow = kickoff_dt.weekday()
+    # Policy:
+    # - Thu/Fri games: release Tue of that same game week, freeze Tue 12:00
+    # - Sat/Sun/Mon games: release the PRIOR Thu, freeze Thu 12:00
+    if dow in (3, 4):  # Thu(3) or Fri(4)
+        # go back to Tuesday of the same week
+        release_day = (kickoff_dt - timedelta(days=(dow - 1)))
+    else:
+        # PRIOR Thursday (works for Sat(5), Sun(6), Mon(0))
+        delta = (dow - 3) % 7  # days since previous Thu
+        release_day = (kickoff_dt - timedelta(days=delta))
+
+    rel = release_day.replace(hour=0, minute=1, second=0, microsecond=0)
+    frz = release_day.replace(hour=12, minute=0, second=0, microsecond=0)
+    return rel, frz
 
 def week_tag_explicit(league: str, kickoff_dt: datetime | None):
     """
