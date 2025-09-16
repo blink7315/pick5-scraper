@@ -313,7 +313,7 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=HEADLESS)
             context = browser.new_context(timezone_id=TIMEZONE, locale="en-US")
-            page = browser.new_page()
+            page = context.new_page()
             page.goto(url, timeout=60000)
             page.wait_for_selector("div.ScheduleTables", timeout=15000)
 
@@ -395,8 +395,50 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
             browser.close()
         return all_rows
 
-    target_url = build_url(year, week)
-    raw_rows = scrape_page(target_url)
+    # Always scrape target + adjacent ESPN week pages; then filter by the deterministic window.
+    pages_to_scrape = []
+    if week is not None:
+        pages_to_scrape = [(year, week)]
+        # probe neighbors; stays within regular-season table
+        for dw in (-1, +1):
+            w2 = week + dw
+            if 1 <= w2 <= REG_WEEKS:
+                pages_to_scrape.append((year, w2))
+    else:
+        # if no week provided, just hit the base schedule
+        pages_to_scrape = [(year, week)]
+
+    # Helper to de-dupe pairs across pages BEFORE filtering (by away/home/date/time tuple)
+    def _dedup_pairs(rows):
+        if not rows:
+            return []
+        seen = set()
+        out = []
+        for i in range(0, len(rows), 2):
+            if i + 1 >= len(rows):
+                break
+            a = rows[i]
+            h = rows[i + 1]
+            key = (str(a[6]).strip(), str(a[7]).strip(), str(a[1]).strip().upper(), str(h[1]).strip().upper())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.extend([a, h])
+        return out
+
+    all_rows = []
+    if week is None:
+        # legacy path; just the base page
+        all_rows = scrape_page(target_url)
+    else:
+        for (y, w) in pages_to_scrape:
+            url = build_url(y, w)
+            part = scrape_page(url)
+            all_rows.extend(part)
+
+    # De-dupe before applying window filter
+    raw_rows = _dedup_pairs(all_rows)
+
 
     # Step 8: Filter by deterministic window
     def parse_kickoff_local(date_text: str, time_text: str, tzname: str) -> datetime | None:
@@ -954,7 +996,8 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
         print(f"🧹 Removed {deleted} legacy misaligned rows from Lines.")
 
     # Purge old weeks so Lines only contains the current week per league
-    if os.environ.get("SKIP_PURGE", "1") != "1":
+    # Default behavior: PURGE runs unless you explicitly set SKIP_PURGE=1
+    if os.environ.get("SKIP_PURGE", "0") != "1":
         _purge_lines_to_current_week(
             spreadsheet,
             now_dt=now,
@@ -964,20 +1007,32 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
     else:
         print("Purge: SKIPPED (SKIP_PURGE=1)")
 
+
     # 🔄 refresh handle; row_count/col_count can be stale after deletes
     lines_ws = spreadsheet.worksheet("Lines")
 
     # Rebuild 'existing' AFTER purge
     existing = lines_ws.get_all_values()
 
-    # Optional spacer before the first CFB block if NFL already exists
+    # Optional spacer before the first CFB block if NFL for THIS week exists but CFB for THIS week does not
     spacer_rows = 0
     if league == "ncaaf":
-        leagues = [(row[8] or "").strip().lower() for row in existing[1:] if len(row) >= 9]
-        has_nfl = any(l == "nfl" for l in leagues)
-        has_cfb = any(l == "ncaaf" for l in leagues)
-        if has_nfl and not has_cfb:
+        now_local = datetime.now(ZoneInfo(TIMEZONE))
+        nfl_tag_current = week_tag_from_table("nfl", now_local) if FORCE_WEEK_TABLE else compute_week_tag(now_local, "nfl", PHASE_NFL)
+        cfb_tag_current = week_tag_from_table("ncaaf", now_local) if FORCE_WEEK_TABLE else compute_week_tag(now_local, "ncaaf", PHASE_CFB)
+
+        # gather existing WeekTags/Leagues from columns I (league) and J (week tag)
+        existing_meta = []
+        for r in existing[1:]:
+            if len(r) >= 10:
+                existing_meta.append(((r[8] or "").strip().lower(), (r[9] or "").strip()))
+
+        has_nfl_this_week = any(l == "nfl" and wt == nfl_tag_current for (l, wt) in existing_meta)
+        has_cfb_this_week = any(l == "ncaaf" and wt == cfb_tag_current for (l, wt) in existing_meta)
+
+        if has_nfl_this_week and not has_cfb_this_week:
             spacer_rows = SPACER_ROWS_BETWEEN_LEAGUES if "SPACER_ROWS_BETWEEN_LEAGUES" in globals() else 4
+
 
     # Primary index: GameKey -> top row
     gamekey_col = 12  # L
