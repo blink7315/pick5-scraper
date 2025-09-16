@@ -395,6 +395,8 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
             browser.close()
         return all_rows
 
+    target_url = build_url(year, week)
+
     # Always scrape target + adjacent ESPN week pages; then filter by the deterministic window.
     pages_to_scrape = []
     if week is not None:
@@ -474,39 +476,10 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
         a = raw_rows[i]
         h = raw_rows[i + 1]
         ko = parse_kickoff_local(a[6], a[7], TIMEZONE)
-        if ko is None:
-            # Step 13: keep one placeholder pair if parse fails
+        # Only keep games whose kickoff parsable AND inside the deterministic window
+        if ko and (win_start <= ko < win_end):
             filtered.extend([a, h])
             kept_pairs += 1
-            continue
-        if win_start <= ko < win_end:
-            filtered.extend([a, h])
-            kept_pairs += 1
-
-    # Step 13 fallback: if 0 pairs, probe week-1 and week+1, still filter by the same window
-    if kept_pairs == 0 and week is not None:
-        for delta in (-1, +1):
-            probe_w = week + delta
-            probe_y = year
-            if probe_w < 1:
-                # no earlier week in table; skip
-                continue
-            if probe_w > REG_WEEKS:
-                # beyond regular-season table; skip
-                continue
-            probe_url = build_url(probe_y, probe_w)
-            alt_rows = scrape_page(probe_url)
-            alt_filtered = []
-            for i in range(0, len(alt_rows), 2):
-                if i + 1 >= len(alt_rows):
-                    break
-                a = alt_rows[i]; h = alt_rows[i+1]
-                ko = parse_kickoff_local(a[6], a[7], TIMEZONE)
-                if ko is None or (win_start <= ko < win_end):
-                    alt_filtered.extend([a, h])
-            if alt_filtered:
-                filtered = alt_filtered
-                break
 
     return filtered
 
@@ -878,18 +851,14 @@ def _purge_lines_to_current_week(spreadsheet, now_dt: datetime, phase_cfb: str, 
 
         league   = (row[8]  or "").strip().lower()  # I
         weektag  = (row[9]  or "").strip()          # J
-        gamekey  = (row[11] or "").strip()          # L
-        locked_v = (row[15] or "").strip().upper()  # P
 
-        if not gamekey:
-            continue  # skip blanks
-
-        # 🔒 Do NOT purge locked rows
-        if locked_v == "Y":
-            continue
-
-        if league in keep_for_league and weektag != keep_for_league[league]:
-            to_delete_tops.append(top)
+        # Purge any pair that belongs to a different WeekTag for this league,
+        # regardless of Locked state and regardless of GameKey presence.
+        if league in keep_for_league:
+            cur = keep_for_league[league]
+            # Delete if the row's weektag is blank OR mismatched vs current week tag.
+            if not weektag or weektag != cur:
+                to_delete_tops.append(top)
 
     if not to_delete_tops:
         print("Purge: nothing to delete.")
@@ -971,11 +940,12 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
     Merge normalized A..H rows into Lines with robust matching and lock safety.
 
     Changes:
-      - Never purge locked rows (handled in _purge_lines_to_current_week).
-      - Locking depends ONLY on freeze time (not publish window).
-      - Secondary match key (WeekTag + teams) when GameKey doesn't line up (e.g., TBD times, manual rows).
-      - Never downgrade an already locked row; outside publish window we don't update existing rows.
+    - Purge of prior weeks (including Locked rows) happens before merge.
+    - Locking depends ONLY on freeze time (not publish window).
+    - Secondary match key (WeekTag + teams) when GameKey doesn't line up (e.g., TBD times, manual rows).
+    - Never overwrite a row marked Locked=Y during updates; outside publish window we don't update existing rows.
     """
+
     tz = ZoneInfo(TIMEZONE)
     now = datetime.now(tz)
 
@@ -996,7 +966,7 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
         print(f"🧹 Removed {deleted} legacy misaligned rows from Lines.")
 
     # Purge old weeks so Lines only contains the current week per league
-    # Default behavior: PURGE runs unless you explicitly set SKIP_PURGE=1
+    # Default: PURGE runs unless SKIP_PURGE=1 is explicitly set.
     if os.environ.get("SKIP_PURGE", "0") != "1":
         _purge_lines_to_current_week(
             spreadsheet,
@@ -1006,7 +976,6 @@ def merge_staging_into_lines(spreadsheet, staging_rows, league: str, phase: str)
         )
     else:
         print("Purge: SKIPPED (SKIP_PURGE=1)")
-
 
     # 🔄 refresh handle; row_count/col_count can be stale after deletes
     lines_ws = spreadsheet.worksheet("Lines")
