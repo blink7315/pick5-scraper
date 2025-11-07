@@ -3,8 +3,12 @@ name: Run pick5 scraper
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 21 * * 2,4"  # 5pm ET during Daylight Time (21:00 UTC)
-    - cron: "0 22 * * 2,4"  # 5pm ET during Standard Time (22:00 UTC)
+    # === Tuesday late-night run (once, around 11–11:30 PM ET) ===
+    - cron: "30 3 * * 3"   # 03:30 UTC Wednesday = 10:30 PM ET (DST) / 11:30 PM ET (Standard) on Tuesday
+
+    # === Thursday evening runs (unchanged) ===
+    - cron: "0 21 * * 4"   # 5 PM ET during Daylight Time (21:00 UTC)
+    - cron: "0 22 * * 4"   # 5 PM ET during Standard Time (22:00 UTC)
 
 concurrency:
   group: pick5-scraper
