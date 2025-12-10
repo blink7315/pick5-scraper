@@ -25,7 +25,7 @@ TIMEZONE = "America/Detroit"
 
 PHASE_CFB = "regular"     # regular | bowls
 PHASE_NFL = "regular"     # regular | playoffs
-COLLEGE_INCLUDE_ALL = False
+COLLEGE_INCLUDE_ALL = True
 
 # Week flow toggles for this run
 include_nfl = True
