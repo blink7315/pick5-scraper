@@ -23,9 +23,9 @@ HEADLESS = os.environ.get("HEADLESS", "1") == "1"
 FORCE_WEEK_TABLE = os.environ.get("FORCE_WEEK_TABLE", "1") == "1"  # ← default ON (Step 14)
 TIMEZONE = "America/Detroit"
 
-PHASE_CFB = "regular"     # regular | bowls
+PHASE_CFB = "bowls"     # regular | bowls Change this to regular during at the beginning of the season
 PHASE_NFL = "regular"     # regular | playoffs
-COLLEGE_INCLUDE_ALL = True
+COLLEGE_INCLUDE_ALL = True     # Change this to False to include top 25 only at the start of the season
 
 # Week flow toggles for this run
 include_nfl = True
@@ -512,13 +512,32 @@ def extract_rank_from_team_cell(cell):
 
 def scrape_college_schedule(year: int | None = None, week: int | None = None):
     print("📡 Running College scraper...")
+
     base_url = "https://www.espn.com/college-football/schedule"
-    if week is not None:
-        url = f"{base_url}/_/week/{week}" + (f"/year/{year}" if year is not None else "")
+
+    # -----------------------------
+    # Decide which ESPN URL to hit
+    # -----------------------------
+    if PHASE_CFB == "bowls":
+        # Bowls live under seasontype=3; ESPN uses week=1 for the whole bowl slate.
+        # Derive a reasonable "season year" if none is provided.
+        if year is None:
+            now = datetime.now(ZoneInfo(TIMEZONE))
+            season_year = now.year if now.month >= 9 else now.year - 1
+            year = season_year
+
+        url = f"{base_url}/_/week/1/year/{year}/seasontype/3"
+        print(f"Using bowls schedule URL: {url}")
     else:
-        url = base_url
+        # Regular-season behavior (unchanged)
+        if week is not None:
+            url = f"{base_url}/_/week/{week}" + (f"/year/{year}" if year is not None else "")
+        else:
+            url = base_url
+        print(f"Using regular CFB schedule URL: {url}")
 
     all_data = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
         context = browser.new_context(timezone_id=TIMEZONE, locale="en-US")
@@ -534,7 +553,7 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
             try:
                 date_text = section.locator("div.Table__Title").text_content().strip()
                 print(f"🗓️ Date: {date_text}")
-            except:
+            except Exception:
                 print("❌ Could not read date title.")
                 continue
 
@@ -560,13 +579,14 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
                     away_rank = extract_rank_from_team_cell(away_cell)
                     home_rank = extract_rank_from_team_cell(home_cell)
 
+                    # Rank filter: only used when COLLEGE_INCLUDE_ALL is False
                     if not COLLEGE_INCLUDE_ALL and (away_rank is None and home_rank is None):
                         continue
 
                     line, ou = "N/A", "N/A"
                     if tds.count() > 6:
                         odds_links = tds.nth(6).locator("a")
-                        for k in range(odds_links.count()):
+                        for k in range(ods_links.count()):
                             raw = odds_links.nth(k).text_content(timeout=1000).strip()
                             t = raw.lower().replace("\u00bd", ".5")
                             if t.startswith("line:") or t.startswith("spread:"):
@@ -616,7 +636,32 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
                     continue
 
         browser.close()
-        return all_data
+
+    # ------------------------------------
+    # For bowl phase: filter by week window
+    # ------------------------------------
+    if PHASE_CFB == "bowls":
+        tz = ZoneInfo(TIMEZONE)
+        now_local = datetime.now(tz)
+        # Reuse NFL deterministic week table to get our Tue→Tue window
+        _, _, win_start, win_end = get_nfl_week_from_table(now_local)
+        print(f"Applying bowl week window: {win_start} → {win_end}")
+
+        filtered = []
+        for i in range(0, len(all_data), 2):
+            if i + 1 >= len(all_data):
+                break
+            a = all_data[i]
+            h = all_data[i + 1]
+            ko = parse_kickoff_local(a[6], a[7], TIMEZONE)
+            if ko and (win_start <= ko < win_end):
+                filtered.extend([a, h])
+
+        print(f"Kept {len(filtered)//2} bowl games for this week window.")
+        return filtered
+
+    # Regular season: no extra filtering here
+    return all_data
 
 # =========================
 # === STAGING + UPSERT  ===
