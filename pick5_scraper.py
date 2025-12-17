@@ -545,16 +545,15 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
         page.goto(url, timeout=60000)
         page.wait_for_selector("div.ScheduleTables--ncaaf")
 
-        date_sections = page.locator("div.ScheduleTables--ncaaf")
+        date_sections = page.locator("div.ScheduleTables--ncaaf > div")
         print(f"✅ Found {date_sections.count()} game date sections\n")
 
         for i in range(date_sections.count()):
             section = date_sections.nth(i)
             try:
                 date_text = section.locator("div.Table__Title").text_content().strip()
-                print(f"🗓️ Date: {date_text}")
-            except Exception:
-                print("❌ Could not read date title.")
+            except Exception as e:
+                print(f"❌ Could not read date title for section {i}: {repr(e)}")
                 continue
 
             rows = section.locator("tr.Table__TR")
@@ -586,7 +585,7 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
                     line, ou = "N/A", "N/A"
                     if tds.count() > 6:
                         odds_links = tds.nth(6).locator("a")
-                        for k in range(ods_links.count()):
+                        for k in range(odds_links.count()):
                             raw = odds_links.nth(k).text_content(timeout=1000).strip()
                             t = raw.lower().replace("\u00bd", ".5")
                             if t.startswith("line:") or t.startswith("spread:"):
@@ -632,7 +631,8 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
                     all_data.append([away_logo, away_name_for_sheet, "", away_line, "", ou_top, date_text, game_time])
                     all_data.append([home_logo, home_name_for_sheet, "", home_line, "", ou_bottom, date_text, game_time])
 
-                except Exception:
+                except Exception as e:
+                    print(f"❌ CFB row parse failed (date={date_text}, row={j}): {repr(e)}")
                     continue
 
         browser.close()
@@ -661,6 +661,9 @@ def scrape_college_schedule(year: int | None = None, week: int | None = None):
         return filtered
 
     # Regular season: no extra filtering here
+    if not all_data:
+        raise RuntimeError(f"CFB scraper produced 0 rows. URL={url}")
+
     return all_data
 
 # =========================
