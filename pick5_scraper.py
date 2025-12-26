@@ -1279,24 +1279,31 @@ def apply_weekly_reset_if_complete(spreadsheet, week_tag_to_clear: str | None):
 # =========================
 # === MAIN ORCHESTRATION ==
 # =========================
+import traceback
+
 if __name__ == "__main__":
-    os.system("cls" if os.name == "nt" else "clear")
+    try:
+        os.system("cls" if os.name == "nt" else "clear")
 
-    nfl_rows = []
-    cfb_rows = []
+        nfl_rows = []
+        cfb_rows = []
 
-    if include_nfl:
-        print("Running NFL scraper...")
-        nfl_rows = scrape_nfl_schedule(year=NFL_YEAR, week=NFL_WEEK)
+        if include_nfl:
+            print("Running NFL scraper...")
+            nfl_rows = scrape_nfl_schedule(year=NFL_YEAR, week=NFL_WEEK)
 
-    if include_college:
-        print("Running College scraper...")
-        cfb_rows = scrape_college_schedule(year=CFB_YEAR, week=CFB_WEEK)
+        if include_college:
+            print("Running College scraper...")
+            cfb_rows = scrape_college_schedule(year=CFB_YEAR, week=CFB_WEEK)
 
-    # Upload per league so metadata (I–R) is correct
-    if nfl_rows:
-        upload_via_staging_and_merge(nfl_rows, league="nfl",   phase=PHASE_NFL)
-    if cfb_rows:
-        upload_via_staging_and_merge(cfb_rows, league="ncaaf", phase=PHASE_CFB)
+        if nfl_rows:
+            upload_via_staging_and_merge(nfl_rows, league="nfl", phase=PHASE_NFL)
+        if cfb_rows:
+            upload_via_staging_and_merge(cfb_rows, league="ncaaf", phase=PHASE_CFB)
 
-    print("✅ Staged upsert complete for all selected leagues.")
+        print("✅ Staged upsert complete for all selected leagues.")
+
+    except Exception as e:
+        print("❌ FAILED:", repr(e))
+        traceback.print_exc()
+        raise
