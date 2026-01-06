@@ -294,134 +294,226 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
     # -------------------------
     # Postseason behavior
     # -------------------------
+# =========================
+# === NFL PLAYOFF WEEK AUTO-DETECT (drop-in) ===
+# =========================
+# Replace your current playoffs block inside scrape_nfl_schedule() with this version.
+# It auto-detects the first playoff week page that has at least one UPCOMING game row
+# (so it will not get stuck on prior weeks once results appear), and it will not
+# try to parse future weeks that only show "TBD / lines" placeholders.
+
+def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
+    """
+    Regular season: existing deterministic Tue→Tue logic (week table + filter).
+    Playoffs: auto-detect current playoff week page (seasontype=3) and scrape only that week.
+    """
+    print("Launching browser and scraping NFL schedule...")
+    tz = ZoneInfo(TIMEZONE)
+    now_local = datetime.now(tz)
+
+    base_url = "https://www.espn.com/nfl/schedule"
+
+    def season_year_from_now(dt: datetime) -> int:
+        # NFL season year: Sep–Dec => same year; Jan–Aug => previous year
+        return dt.year if dt.month >= 9 else dt.year - 1
+
+    # -------------------------
+    # Postseason behavior (AUTO week)
+    # -------------------------
     if PHASE_NFL == "playoffs":
         season_year = year if year is not None else season_year_from_now(now_local)
 
-        def build_url_playoffs(w: int):
+        def build_url_playoffs(w: int) -> str:
             return f"{base_url}/_/week/{w}/year/{season_year}/seasontype/3"
 
-        # Rolling window: keep upcoming games (and very recent) so sheet stays populated
-        win_start = now_local - timedelta(days=1)
-        win_end   = now_local + timedelta(days=21)
+        # ESPN playoff schedule pages are typically weeks 1..4
+        playoff_weeks = [1, 2, 3, 4]
 
-        weeks_to_scrape = [1, 2, 3, 4]  # Wild Card..Super Bowl week pages as ESPN organizes them
+        def _parse_dt_from_row(date_header: str, time_text: str) -> datetime | None:
+            # Uses your existing parser
+            return parse_kickoff_local(date_header, time_text, TIMEZONE)
 
-        def scrape_page(url):
-            all_rows = []
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=HEADLESS)
-                context = browser.new_context(timezone_id=TIMEZONE, locale="en-US")
-                page = context.new_page()
+        def _row_has_upcoming_game(date_header: str, time_text: str) -> bool:
+            dt = _parse_dt_from_row(date_header, time_text)
+            if not dt:
+                return False
+            return dt >= (now_local - timedelta(hours=6))  # small grace window
+
+        def detect_current_playoff_week(page) -> int | None:
+            """
+            Find the FIRST playoff week page that contains at least one upcoming game time we can parse.
+            This avoids:
+              - Week 1 after games are over (dt in past)
+              - Future weeks that are all TBD (no parseable times)
+            """
+            for w in playoff_weeks:
+                url = build_url_playoffs(w)
                 page.goto(url, timeout=60000)
                 page.wait_for_selector("div.ScheduleTables", timeout=20000)
 
                 date_sections = page.locator("div.ScheduleTables > div")
-                print(f"✅ Found {date_sections.count()} game date sections on {url}\n")
+                if date_sections.count() == 0:
+                    continue
+
+                found_upcoming = False
 
                 for i in range(date_sections.count()):
                     section = date_sections.nth(i)
-                    date_header = section.locator("div.Table__Title").text_content().strip()
-                    rows = section.locator("tbody tr")
+                    try:
+                        date_header = section.locator("div.Table__Title").text_content().strip()
+                    except Exception:
+                        continue
 
+                    rows = section.locator("tbody tr")
                     for j in range(rows.count()):
                         row = rows.nth(j)
                         tds = row.locator("td")
-                        if tds.count() < 2:
+                        if tds.count() < 3:
                             continue
+                        time_text = tds.nth(2).text_content(timeout=2000).strip()
 
-                        away_team_cell = tds.nth(0)
-                        home_team_cell = tds.nth(1)
+                        if _row_has_upcoming_game(date_header, time_text):
+                            found_upcoming = True
+                            break
 
-                        away_team = away_team_cell.locator("span.Table__Team a").nth(1).text_content(timeout=2000).strip()
-                        home_team = home_team_cell.locator("span.Table__Team a").nth(1).text_content(timeout=2000).strip()
-                        game_time = tds.nth(2).text_content(timeout=1000).strip() if tds.count() > 2 else "N/A"
+                    if found_upcoming:
+                        break
 
-                        away_logo_url = away_team_cell.locator("img").get_attribute("src") or ""
-                        home_logo_url = home_team_cell.locator("img").get_attribute("src") or ""
+                print(f"Playoffs week {w}: upcoming_game_found={found_upcoming} ({url})")
+                if found_upcoming:
+                    return w
 
-                        away_logo_formula = get_logo_formula(away_team, away_logo_url, league="nfl")
-                        home_logo_formula = get_logo_formula(home_team, home_logo_url, league="nfl")
+            return None
 
-                        line, ou = "N/A", "N/A"
-                        if tds.count() > 6:
-                            odds_links = tds.nth(6).locator("a")
-                            for k in range(odds_links.count()):
-                                raw = odds_links.nth(k).text_content(timeout=1000).strip()
-                                t = raw.lower().replace("\u00bd", ".5")
-                                if t.startswith("line:") or t.startswith("spread:"):
-                                    line = raw.split(":", 1)[-1].strip()
-                                elif t.startswith("o/u:") or t.startswith("total:"):
-                                    ou = raw.split(":", 1)[-1].strip()
-                                elif re.match(r"^[A-Za-z]{2,4}\s*[+-]\d+(\.\d+)?$", raw):
-                                    line = raw.strip()
+        def scrape_playoff_week(page, playoff_week: int):
+            url = build_url_playoffs(playoff_week)
+            print(f"Scraping detected NFL playoff week {playoff_week}: {url}")
 
-                        def resolve_abbreviation_by_logo(team_name, logo_url):
-                            u = (logo_url or "").lower()
-                            if "nyg" in u: return "NYG"
-                            if "nyj" in u: return "NYJ"
-                            if "lar" in u: return "LAR"
-                            if "lac" in u: return "LAC"
-                            return find_abbreviation(team_name)
+            all_rows = []
+            page.goto(url, timeout=60000)
+            page.wait_for_selector("div.ScheduleTables", timeout=20000)
 
-                        away_abbr = resolve_abbreviation_by_logo(away_team, away_logo_url)
-                        home_abbr = resolve_abbreviation_by_logo(home_team, home_logo_url)
+            date_sections = page.locator("div.ScheduleTables > div")
+            print(f"✅ Found {date_sections.count()} game date sections on {url}\n")
 
-                        away_line = home_line = "N/A"
-                        if line != "N/A":
-                            parts = line.split()
-                            if len(parts) == 2:
-                                favored_abbr, raw_spread = parts
-                                try:
-                                    spread = float(raw_spread.replace("+", "").replace("-", ""))
-                                    spread_str = f"{spread:.1f}".rstrip('0').rstrip('.')
-                                    if favored_abbr == away_abbr:
-                                        away_line = f"{away_abbr} -{spread_str}"
-                                        home_line = f"{home_abbr} +{spread_str}"
-                                    elif favored_abbr == home_abbr:
-                                        home_line = f"{home_abbr} -{spread_str}"
-                                        away_line = f"{away_abbr} +{spread_str}"
-                                except ValueError:
-                                    pass
+            for i in range(date_sections.count()):
+                section = date_sections.nth(i)
+                date_header = section.locator("div.Table__Title").text_content().strip()
+                rows = section.locator("tbody tr")
 
-                        ou_top = f"O {ou}" if ou != "N/A" else "N/A"
-                        ou_bottom = f"U {ou}" if ou != "N/A" else "N/A"
+                for j in range(rows.count()):
+                    row = rows.nth(j)
+                    tds = row.locator("td")
+                    if tds.count() < 2:
+                        continue
 
-                        all_rows.append([away_logo_formula, away_team, "", away_line, "", ou_top, date_header, game_time])
-                        all_rows.append([home_logo_formula, home_team, "", home_line, "", ou_bottom, date_header, game_time])
+                    away_team_cell = tds.nth(0)
+                    home_team_cell = tds.nth(1)
 
+                    # Make this more robust: don’t hard-fail if nth(1) doesn’t exist yet
+                    away_links = away_team_cell.locator("span.Table__Team a")
+                    home_links = home_team_cell.locator("span.Table__Team a")
+                    if away_links.count() == 0 or home_links.count() == 0:
+                        continue
+
+                    # Prefer last() rather than nth(1) because ESPN markup can vary
+                    away_team = away_links.last.text_content(timeout=5000).strip()
+                    home_team = home_links.last.text_content(timeout=5000).strip()
+
+                    game_time = tds.nth(2).text_content(timeout=5000).strip() if tds.count() > 2 else "N/A"
+
+                    away_logo_url = away_team_cell.locator("img").get_attribute("src") or ""
+                    home_logo_url = home_team_cell.locator("img").get_attribute("src") or ""
+
+                    away_logo_formula = get_logo_formula(away_team, away_logo_url, league="nfl")
+                    home_logo_formula = get_logo_formula(home_team, home_logo_url, league="nfl")
+
+                    line, ou = "N/A", "N/A"
+                    if tds.count() > 6:
+                        odds_links = tds.nth(6).locator("a")
+                        for k in range(odds_links.count()):
+                            raw = odds_links.nth(k).text_content(timeout=2000).strip()
+                            t = raw.lower().replace("\u00bd", ".5")
+                            if t.startswith("line:") or t.startswith("spread:"):
+                                line = raw.split(":", 1)[-1].strip()
+                            elif t.startswith("o/u:") or t.startswith("total:"):
+                                ou = raw.split(":", 1)[-1].strip()
+                            elif re.match(r"^[A-Za-z]{2,4}\s*[+-]\d+(\.\d+)?$", raw):
+                                line = raw.strip()
+
+                    def resolve_abbreviation_by_logo(team_name, logo_url):
+                        u = (logo_url or "").lower()
+                        if "nyg" in u: return "NYG"
+                        if "nyj" in u: return "NYJ"
+                        if "lar" in u: return "LAR"
+                        if "lac" in u: return "LAC"
+                        return find_abbreviation(team_name)
+
+                    away_abbr = resolve_abbreviation_by_logo(away_team, away_logo_url)
+                    home_abbr = resolve_abbreviation_by_logo(home_team, home_logo_url)
+
+                    away_line = home_line = "N/A"
+                    if line != "N/A":
+                        parts = line.split()
+                        if len(parts) == 2:
+                            favored_abbr, raw_spread = parts
+                            try:
+                                spread = float(raw_spread.replace("+", "").replace("-", ""))
+                                spread_str = f"{spread:.1f}".rstrip("0").rstrip(".")
+                                if favored_abbr == away_abbr:
+                                    away_line = f"{away_abbr} -{spread_str}"
+                                    home_line = f"{home_abbr} +{spread_str}"
+                                elif favored_abbr == home_abbr:
+                                    home_line = f"{home_abbr} -{spread_str}"
+                                    away_line = f"{away_abbr} +{spread_str}"
+                            except ValueError:
+                                pass
+
+                    ou_top = f"O {ou}" if ou != "N/A" else "N/A"
+                    ou_bottom = f"U {ou}" if ou != "N/A" else "N/A"
+
+                    all_rows.append([away_logo_formula, away_team, "", away_line, "", ou_top, date_header, game_time])
+                    all_rows.append([home_logo_formula, home_team, "", home_line, "", ou_bottom, date_header, game_time])
+
+            # De-dupe pairs (same as your existing)
+            def _dedup_pairs(rows):
+                seen = set()
+                out = []
+                for i in range(0, len(rows), 2):
+                    if i + 1 >= len(rows): break
+                    a, h = rows[i], rows[i + 1]
+                    key = (str(a[6]).strip(), str(a[7]).strip(), str(a[1]).strip().upper(), str(h[1]).strip().upper())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.extend([a, h])
+                return out
+
+            return _dedup_pairs(all_rows)
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=HEADLESS)
+            context = browser.new_context(timezone_id=TIMEZONE, locale="en-US")
+            page = context.new_page()
+
+            detected = detect_current_playoff_week(page)
+            if detected is None:
                 browser.close()
-            return all_rows
+                raise RuntimeError(
+                    f"Could not detect current playoff week (no upcoming parseable games) for year={season_year}."
+                )
 
-        all_rows = []
-        for w in weeks_to_scrape:
-            all_rows.extend(scrape_page(build_url_playoffs(w)))
+            rows = scrape_playoff_week(page, detected)
+            browser.close()
 
-        # De-dupe pairs
-        def _dedup_pairs(rows):
-            seen = set()
-            out = []
-            for i in range(0, len(rows), 2):
-                if i + 1 >= len(rows): break
-                a, h = rows[i], rows[i+1]
-                key = (str(a[6]).strip(), str(a[7]).strip(), str(a[1]).strip().upper(), str(h[1]).strip().upper())
-                if key in seen: continue
-                seen.add(key)
-                out.extend([a, h])
-            return out
+        # Optional: keep a rolling filter if you still want (but now it’s only one week anyway)
+        return rows
 
-        raw_rows = _dedup_pairs(all_rows)
-
-        # Rolling-window filter
-        filtered = []
-        for i in range(0, len(raw_rows), 2):
-            if i + 1 >= len(raw_rows): break
-            a, h = raw_rows[i], raw_rows[i+1]
-            ko = parse_kickoff_local(a[6], a[7], TIMEZONE)
-            if ko and (win_start <= ko < win_end):
-                filtered.extend([a, h])
-
-        print(f"NFL playoffs: kept {len(filtered)//2} games in rolling window.")
-        return filtered
+    # -------------------------
+    # Regular-season behavior (UNCHANGED)
+    # -------------------------
+    # Leave the rest of your existing function exactly as it is below this point.
+    # (your original regular-season code continues here...)
 
     # -------------------------
     # Regular-season behavior (your existing logic)
