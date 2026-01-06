@@ -24,7 +24,7 @@ FORCE_WEEK_TABLE = os.environ.get("FORCE_WEEK_TABLE", "1") == "1"  # ← default
 TIMEZONE = "America/Detroit"
 
 PHASE_CFB = "bowls"     # regular | bowls Change this to regular during at the beginning of the season
-PHASE_NFL = "regular"     # regular | playoffs
+PHASE_NFL = "playoffs"     # regular | playoffs
 COLLEGE_INCLUDE_ALL = True     # Change this to False to include top 25 only at the start of the season
 
 # Week flow toggles for this run
@@ -278,16 +278,156 @@ def find_abbreviation(team_name, logo_url=""):
 # =========================
 def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
     """
-    Step 7+8+13:
-    - Determine (yr, wk, win_start, win_end) from deterministic table if FORCE_WEEK_TABLE=1.
-    - Navigate to ESPN /week/{wk}/year/{yr}.
-    - After scraping, filter rows by local kickoff inside [win_start, win_end).
-    - Resiliency: if 0 pairs after filter, probe week-1 and week+1 (still filter by same window).
+    Regular season: existing deterministic Tue→Tue logic (week table + filter).
+    Playoffs: scrape ESPN postseason (seasontype=3) and keep games in a rolling window.
     """
     print("Launching browser and scraping NFL schedule...")
     tz = ZoneInfo(TIMEZONE)
     now_local = datetime.now(tz)
 
+    base_url = "https://www.espn.com/nfl/schedule"
+
+    def season_year_from_now(dt: datetime) -> int:
+        # NFL season year: Sep–Dec => same year; Jan–Aug => previous year
+        return dt.year if dt.month >= 9 else dt.year - 1
+
+    # -------------------------
+    # Postseason behavior
+    # -------------------------
+    if PHASE_NFL == "playoffs":
+        season_year = year if year is not None else season_year_from_now(now_local)
+
+        def build_url_playoffs(w: int):
+            return f"{base_url}/_/week/{w}/year/{season_year}/seasontype/3"
+
+        # Rolling window: keep upcoming games (and very recent) so sheet stays populated
+        win_start = now_local - timedelta(days=1)
+        win_end   = now_local + timedelta(days=21)
+
+        weeks_to_scrape = [1, 2, 3, 4]  # Wild Card..Super Bowl week pages as ESPN organizes them
+
+        def scrape_page(url):
+            all_rows = []
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=HEADLESS)
+                context = browser.new_context(timezone_id=TIMEZONE, locale="en-US")
+                page = context.new_page()
+                page.goto(url, timeout=60000)
+                page.wait_for_selector("div.ScheduleTables", timeout=20000)
+
+                date_sections = page.locator("div.ScheduleTables > div")
+                print(f"✅ Found {date_sections.count()} game date sections on {url}\n")
+
+                for i in range(date_sections.count()):
+                    section = date_sections.nth(i)
+                    date_header = section.locator("div.Table__Title").text_content().strip()
+                    rows = section.locator("tbody tr")
+
+                    for j in range(rows.count()):
+                        row = rows.nth(j)
+                        tds = row.locator("td")
+                        if tds.count() < 2:
+                            continue
+
+                        away_team_cell = tds.nth(0)
+                        home_team_cell = tds.nth(1)
+
+                        away_team = away_team_cell.locator("span.Table__Team a").nth(1).text_content(timeout=2000).strip()
+                        home_team = home_team_cell.locator("span.Table__Team a").nth(1).text_content(timeout=2000).strip()
+                        game_time = tds.nth(2).text_content(timeout=1000).strip() if tds.count() > 2 else "N/A"
+
+                        away_logo_url = away_team_cell.locator("img").get_attribute("src") or ""
+                        home_logo_url = home_team_cell.locator("img").get_attribute("src") or ""
+
+                        away_logo_formula = get_logo_formula(away_team, away_logo_url, league="nfl")
+                        home_logo_formula = get_logo_formula(home_team, home_logo_url, league="nfl")
+
+                        line, ou = "N/A", "N/A"
+                        if tds.count() > 6:
+                            odds_links = tds.nth(6).locator("a")
+                            for k in range(odds_links.count()):
+                                raw = odds_links.nth(k).text_content(timeout=1000).strip()
+                                t = raw.lower().replace("\u00bd", ".5")
+                                if t.startswith("line:") or t.startswith("spread:"):
+                                    line = raw.split(":", 1)[-1].strip()
+                                elif t.startswith("o/u:") or t.startswith("total:"):
+                                    ou = raw.split(":", 1)[-1].strip()
+                                elif re.match(r"^[A-Za-z]{2,4}\s*[+-]\d+(\.\d+)?$", raw):
+                                    line = raw.strip()
+
+                        def resolve_abbreviation_by_logo(team_name, logo_url):
+                            u = (logo_url or "").lower()
+                            if "nyg" in u: return "NYG"
+                            if "nyj" in u: return "NYJ"
+                            if "lar" in u: return "LAR"
+                            if "lac" in u: return "LAC"
+                            return find_abbreviation(team_name)
+
+                        away_abbr = resolve_abbreviation_by_logo(away_team, away_logo_url)
+                        home_abbr = resolve_abbreviation_by_logo(home_team, home_logo_url)
+
+                        away_line = home_line = "N/A"
+                        if line != "N/A":
+                            parts = line.split()
+                            if len(parts) == 2:
+                                favored_abbr, raw_spread = parts
+                                try:
+                                    spread = float(raw_spread.replace("+", "").replace("-", ""))
+                                    spread_str = f"{spread:.1f}".rstrip('0').rstrip('.')
+                                    if favored_abbr == away_abbr:
+                                        away_line = f"{away_abbr} -{spread_str}"
+                                        home_line = f"{home_abbr} +{spread_str}"
+                                    elif favored_abbr == home_abbr:
+                                        home_line = f"{home_abbr} -{spread_str}"
+                                        away_line = f"{away_abbr} +{spread_str}"
+                                except ValueError:
+                                    pass
+
+                        ou_top = f"O {ou}" if ou != "N/A" else "N/A"
+                        ou_bottom = f"U {ou}" if ou != "N/A" else "N/A"
+
+                        all_rows.append([away_logo_formula, away_team, "", away_line, "", ou_top, date_header, game_time])
+                        all_rows.append([home_logo_formula, home_team, "", home_line, "", ou_bottom, date_header, game_time])
+
+                browser.close()
+            return all_rows
+
+        all_rows = []
+        for w in weeks_to_scrape:
+            all_rows.extend(scrape_page(build_url_playoffs(w)))
+
+        # De-dupe pairs
+        def _dedup_pairs(rows):
+            seen = set()
+            out = []
+            for i in range(0, len(rows), 2):
+                if i + 1 >= len(rows): break
+                a, h = rows[i], rows[i+1]
+                key = (str(a[6]).strip(), str(a[7]).strip(), str(a[1]).strip().upper(), str(h[1]).strip().upper())
+                if key in seen: continue
+                seen.add(key)
+                out.extend([a, h])
+            return out
+
+        raw_rows = _dedup_pairs(all_rows)
+
+        # Rolling-window filter
+        filtered = []
+        for i in range(0, len(raw_rows), 2):
+            if i + 1 >= len(raw_rows): break
+            a, h = raw_rows[i], raw_rows[i+1]
+            ko = parse_kickoff_local(a[6], a[7], TIMEZONE)
+            if ko and (win_start <= ko < win_end):
+                filtered.extend([a, h])
+
+        print(f"NFL playoffs: kept {len(filtered)//2} games in rolling window.")
+        return filtered
+
+    # -------------------------
+    # Regular-season behavior (your existing logic)
+    # -------------------------
+    # (This is your original function body from here down, unchanged except indentation)
+    print("NFL regular-season mode...")
     # Override via deterministic mapping
     if FORCE_WEEK_TABLE:
         yr_map, wk_map, win_start, win_end = get_nfl_week_from_table(now_local)
@@ -295,14 +435,8 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
         week = wk_map
         window_bounds = (win_start, win_end)
     else:
-        # Fallback: still allow explicit overrides if provided
-        if year is None or week is None:
-            # If missing, we still try ESPN's base page (not recommended)
-            pass
-        # Build a synthetic window wide enough so filter doesn't drop everything
         window_bounds = (now_local - timedelta(days=4), now_local + timedelta(days=10))
 
-    base_url = "https://www.espn.com/nfl/schedule"
     def build_url(y, w):
         if w is not None:
             return f"{base_url}/_/week/{w}" + (f"/year/{y}" if y is not None else "")
@@ -388,7 +522,6 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
                     ou_top = f"O {ou}" if ou != "N/A" else "N/A"
                     ou_bottom = f"U {ou}" if ou != "N/A" else "N/A"
 
-                    # A..H: Logo, Team, Pick#, Line, Pick#, O/U, Date, Time
                     all_rows.append([away_logo_formula, away_team, "", away_line, "", ou_top, date_header, game_time])
                     all_rows.append([home_logo_formula, home_team, "", home_line, "", ou_bottom, date_header, game_time])
 
@@ -397,23 +530,17 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
 
     target_url = build_url(year, week)
 
-    # Always scrape target + adjacent ESPN week pages; then filter by the deterministic window.
     pages_to_scrape = []
     if week is not None:
         pages_to_scrape = [(year, week)]
-        # probe neighbors; stays within regular-season table
         for dw in (-1, +1):
             w2 = week + dw
             if 1 <= w2 <= REG_WEEKS:
                 pages_to_scrape.append((year, w2))
     else:
-        # if no week provided, just hit the base schedule
         pages_to_scrape = [(year, week)]
 
-    # Helper to de-dupe pairs across pages BEFORE filtering (by away/home/date/time tuple)
     def _dedup_pairs(rows):
-        if not rows:
-            return []
         seen = set()
         out = []
         for i in range(0, len(rows), 2):
@@ -430,56 +557,23 @@ def scrape_nfl_schedule(year: int | None = None, week: int | None = None):
 
     all_rows = []
     if week is None:
-        # legacy path; just the base page
         all_rows = scrape_page(target_url)
     else:
         for (y, w) in pages_to_scrape:
-            url = build_url(y, w)
-            part = scrape_page(url)
-            all_rows.extend(part)
+            all_rows.extend(scrape_page(build_url(y, w)))
 
-    # De-dupe before applying window filter
     raw_rows = _dedup_pairs(all_rows)
-
-
-    # Step 8: Filter by deterministic window
-    def parse_kickoff_local(date_text: str, time_text: str, tzname: str) -> datetime | None:
-        if not date_text or not time_text or time_text.upper() in ("TBD","N/A","-","POSTPONED"):
-            return None
-        try:
-            m = re.search(r"([A-Za-z]+)\s+(\d{1,2})", date_text)
-            if not m:
-                return None
-            month, day = m.group(1), int(m.group(2))
-            t = re.search(r"(\d{1,2}:\d{2}\s*[AP]M)", time_text, re.IGNORECASE)
-            if not t:
-                return None
-            timestr = t.group(1).upper().replace(" ", "")
-            now = datetime.now(ZoneInfo(tzname))
-            year = now.year
-            month_num = datetime.strptime(month, "%B").month
-            if now.month >= 11 and month_num <= 2:
-                year = now.year + 1
-            dt = datetime.strptime(f"{month} {day} {year} {timestr}", "%B %d %Y %I:%M%p").replace(tzinfo=ZoneInfo(tzname))
-            if (now - dt).days > 180:
-                dt = dt.replace(year=dt.year + 1)
-            return dt
-        except Exception:
-            return None
 
     win_start, win_end = window_bounds
     filtered = []
-    kept_pairs = 0
     for i in range(0, len(raw_rows), 2):
         if i + 1 >= len(raw_rows):
             break
         a = raw_rows[i]
         h = raw_rows[i + 1]
         ko = parse_kickoff_local(a[6], a[7], TIMEZONE)
-        # Only keep games whose kickoff parsable AND inside the deterministic window
         if ko and (win_start <= ko < win_end):
             filtered.extend([a, h])
-            kept_pairs += 1
 
     return filtered
 
@@ -732,11 +826,18 @@ def compute_release_freeze(kickoff_dt: datetime | None, league: str, phase: str)
 
 def week_tag_explicit(league: str, kickoff_dt: datetime | None):
     """
-    Step 7+9+12:
-    - If FORCE_WEEK_TABLE=1: use deterministic mapping for NFL and CFB tags.
-    - Else: preserve explicit override behavior (NFL_WEEK/CFB_WEEK), then fall back.
+    - Regular season: use deterministic week table if FORCE_WEEK_TABLE=1.
+    - Postseason (NFL playoffs / CFB bowls): do NOT use deterministic week tags.
+      Let compute_week_tag() produce YYYY-NFL-Playoffs / YYYY-CFB-Bowls.
     """
     now_local = datetime.now(ZoneInfo(TIMEZONE))
+
+    # 🔑 Postseason override: bypass deterministic table tagging
+    if league == "nfl" and PHASE_NFL == "playoffs":
+        return None
+    if league == "ncaaf" and PHASE_CFB == "bowls":
+        return None
+
     if FORCE_WEEK_TABLE:
         if league == "nfl":
             return week_tag_from_table("nfl", now_local)
@@ -750,6 +851,7 @@ def week_tag_explicit(league: str, kickoff_dt: datetime | None):
     if league == "nfl" and NFL_WEEK is not None:
         yr = NFL_YEAR or (kickoff_dt.year if kickoff_dt else now_local.year)
         return f"{yr}-NFL-Wk{NFL_WEEK}"
+
     return None
 
 def compute_week_tag(kickoff_dt: datetime | None, league: str, phase: str) -> str:
@@ -867,7 +969,9 @@ def _cleanup_legacy_misaligned_rows(lines_ws):
 
 def _purge_lines_to_current_week(spreadsheet, now_dt: datetime, phase_cfb: str, phase_nfl: str):
     """
-    Step 9: Purge based on deterministic WeekTag for BOTH leagues.
+    Purge based on the correct "current" tag for each league.
+    - Regular season: deterministic week table (if FORCE_WEEK_TABLE=1)
+    - Postseason: YYYY-*-Playoffs / YYYY-*-Bowls from compute_week_tag()
     """
     try:
         lines_ws = spreadsheet.worksheet("Lines")
@@ -878,18 +982,18 @@ def _purge_lines_to_current_week(spreadsheet, now_dt: datetime, phase_cfb: str, 
     if not vals or len(vals) < 2:
         return
 
-    # Current tags from mapping (or fallback to legacy if not forced)
-    if FORCE_WEEK_TABLE:
-        nfl_tag = week_tag_from_table("nfl", now_dt)
-        cfb_tag = week_tag_from_table("ncaaf", now_dt)
+    # Decide current tags
+    if phase_nfl == "playoffs":
+        nfl_tag = compute_week_tag(now_dt, league="nfl", phase="playoffs")
     else:
-        cfb_tag = week_tag_explicit("ncaaf", now_dt) or compute_week_tag(now_dt, league="ncaaf", phase=phase_cfb)
-        nfl_tag = week_tag_explicit("nfl",   now_dt) or compute_week_tag(now_dt, league="nfl",   phase=phase_nfl)
+        nfl_tag = week_tag_from_table("nfl", now_dt) if FORCE_WEEK_TABLE else compute_week_tag(now_dt, league="nfl", phase=phase_nfl)
 
-    keep_for_league = {
-        "ncaaf": cfb_tag,
-        "nfl":   nfl_tag,
-    }
+    if phase_cfb == "bowls":
+        cfb_tag = compute_week_tag(now_dt, league="ncaaf", phase="bowls")
+    else:
+        cfb_tag = week_tag_from_table("ncaaf", now_dt) if FORCE_WEEK_TABLE else compute_week_tag(now_dt, league="ncaaf", phase=phase_cfb)
+
+    keep_for_league = {"ncaaf": cfb_tag, "nfl": nfl_tag}
 
     to_delete_tops = []
     for top in range(2, len(vals) + 1, 2):
@@ -897,14 +1001,11 @@ def _purge_lines_to_current_week(spreadsheet, now_dt: datetime, phase_cfb: str, 
         if len(row) < 12:
             continue
 
-        league   = (row[8]  or "").strip().lower()  # I
-        weektag  = (row[9]  or "").strip()          # J
+        league  = (row[8] or "").strip().lower()  # I
+        weektag = (row[9] or "").strip()          # J
 
-        # Purge any pair that belongs to a different WeekTag for this league,
-        # regardless of Locked state and regardless of GameKey presence.
         if league in keep_for_league:
             cur = keep_for_league[league]
-            # Delete if the row's weektag is blank OR mismatched vs current week tag.
             if not weektag or weektag != cur:
                 to_delete_tops.append(top)
 
@@ -931,11 +1032,7 @@ def _purge_lines_to_current_week(spreadsheet, now_dt: datetime, phase_cfb: str, 
     remaining_after = cur_rows - frozen_rows - rows_to_delete
 
     if remaining_after <= 1:
-        need_pairs_left = 2
-        additional_needed = need_pairs_left - remaining_after
-        if additional_needed < 2:
-            additional_needed = 2
-        new_total_rows = cur_rows + additional_needed
+        new_total_rows = cur_rows + 2
         print(f"⚠️ Purge would delete all non-frozen rows. Pre-growing grid {cur_rows}→{new_total_rows}")
         lines_ws.resize(rows=new_total_rows, cols=lines_ws.col_count)
 
